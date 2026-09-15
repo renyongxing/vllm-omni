@@ -79,14 +79,15 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+
 # ResBlock is platform-dispatched in the layers package __init__: CUDA gets
 # fused GroupNorm+SiLU and AdaGN kernels, every other backend gets the plain
 # PyTorch block. UNetDown and UNetUp below instantiate whichever one this
 # resolves to.
 from vllm_omni.diffusion.models.hunyuan_image3.layers import ResBlock
 from vllm_omni.diffusion.models.hunyuan_image3.layers.common import conv_nd, normalization
-from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.diffusion.models.hunyuan_image3.mixfusion import MixFusionSequencePlan
+from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 from vllm_omni.platforms import current_omni_platform
 
@@ -1247,7 +1248,6 @@ class ImageKVCacheManager(nn.Module):
         self.image_kv_cache_lens = None
 
     def _forward_paged(
-
         self,
         query: torch.Tensor,
         key: torch.Tensor,

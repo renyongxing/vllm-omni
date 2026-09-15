@@ -53,7 +53,6 @@ from .hunyuan_image3_transformer import (
     real_batched_index_select,
     retrieve_timesteps,
 )
-from .request_layout import HunyuanPreparedLayout
 from .mixfusion import (
     MixFusionSequencePlan,
     build_mixfusion_sequence_plan,
@@ -61,7 +60,7 @@ from .mixfusion import (
     split_sequences_to_mixfusion_chunks,
     validate_mixfusion_sequence_plan,
 )
-from .system_prompt import get_system_prompt
+from .request_layout import HunyuanPreparedLayout
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -1421,7 +1420,6 @@ class HunyuanImage3Pipeline(
                     "`batch_gen_image_info` should have the same batch size as `prompt`."
                 )
 
-
             if batch_cond_image_info is not None:
                 assert isinstance(batch_cond_image_info, list) and len(batch_cond_image_info) == batch_size, (
                     "`batch_cond_image_info` should be a list with the same batch size as `prompt`."
@@ -2092,7 +2090,6 @@ class HunyuanImage3Pipeline(
                 first_step,
                 num_special_tokens,
                 mixfusion_sequence_plan=mixfusion_sequence_plan,
-
             )
 
         if not return_dict:
