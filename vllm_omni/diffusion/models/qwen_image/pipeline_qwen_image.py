@@ -823,6 +823,8 @@ class QwenImagePipeline(
         extra_args = getattr(state.sampling, "extra_args", {}) or {}
         if bool(extra_args.get("enable_mixfusion", False)):
             state.extra["use_ragged_latents"] = True
+            state.extra["mixfusion_min_chunk_tokens"] = extra_args.get("mixfusion_min_chunk_tokens", 256)
+            state.extra["mixfusion_max_chunks"] = extra_args.get("mixfusion_max_chunks", 128)
 
         return state
 
