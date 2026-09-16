@@ -740,6 +740,7 @@ class QwenImageCrossAttention(nn.Module):
         text_freqs: torch.Tensor,
         chunk_to_request: torch.Tensor,
         request_chunk_ranges: list[tuple[int, int]],
+        real_txt_lens: list[int],
         encoder_hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run Qwen joint attention with chunked image tokens and request-level text.
@@ -778,25 +779,16 @@ class QwenImageCrossAttention(nn.Module):
         # Per-token rotary frequencies laid out in MixFusion chunk order:
         # [B_chunk, chunk_size, D/2] flattened to [B_chunk*chunk_size, D/2] so
         # every image token carries its own (chunk-position, resolution) freq.
-        img_cos = image_freq_chunks.real.to(img_query.dtype).reshape(-1, image_freq_chunks.shape[-1])
-        img_sin = image_freq_chunks.imag.to(img_query.dtype).reshape(-1, image_freq_chunks.shape[-1])
-        txt_cos = text_freqs.real.to(txt_query.dtype)
-        txt_sin = text_freqs.imag.to(txt_query.dtype)
+        img_cos = image_freq_chunks.real.reshape(-1, image_freq_chunks.shape[-1])
+        img_sin = image_freq_chunks.imag.reshape(-1, image_freq_chunks.shape[-1])
+        txt_cos = text_freqs.real
+        txt_sin = text_freqs.imag
 
         seq_len_txt = encoder_hidden_states.shape[1]
         chunk_size = image_chunks.shape[1]
         num_requests = encoder_hidden_states.shape[0]
         text_outputs: list[torch.Tensor | None] = [None] * num_requests
         image_outputs: list[torch.Tensor | None] = [None] * image_chunks.shape[0]
-
-        # Per-request real text length. Prompt padding is dropped from the flat
-        # packed joint attention so padded text tokens never enter the kernel
-        # (padded_tokens == 0), matching the mask-unpad path used by the dense
-        # joint forward.
-        if encoder_hidden_states_mask is not None:
-            real_txt_lens = encoder_hidden_states_mask.sum(dim=1).tolist()
-        else:
-            real_txt_lens = [seq_len_txt] * num_requests
 
         flat_queries: list[torch.Tensor] = []
         flat_keys: list[torch.Tensor] = []
@@ -832,31 +824,62 @@ class QwenImageCrossAttention(nn.Module):
         # to drop), so per-chunk/per-request frequencies are preserved exactly.
         # Replaces the unfused torch path (mul/neg/cat elementwise, 4 calls)
         # with one fused Triton kernel per q/k.
-        joint_query = self.rope(joint_query, joint_cos, joint_sin)
-        joint_key = self.rope(joint_key, joint_cos, joint_sin)
-        cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=joint_query.device)
-        attn_metadata = AttentionMetadata(
-            is_varlen=True,
-            q_cu_seqlens=cu_seqlens_tensor,
-            kv_cu_seqlens=cu_seqlens_tensor,
-            max_q_len=max_seq_len,
-            max_kv_len=max_seq_len,
-            padded_tokens=0,
-        )
-        joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
+        # Keep RoPE frequencies in FP32 for precision. The vLLM fused kernel
+        # requires query/key and cos/sin to share a dtype, so promote the
+        # rotated tensors to FP32 and cast only the outputs back to the
+        # original query/key dtype.
+        joint_query = self.rope(joint_query.float(), joint_cos, joint_sin).to(joint_query.dtype)
+        joint_key = self.rope(joint_key.float(), joint_cos, joint_sin).to(joint_key.dtype)
 
-        for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
-            txt_len = int(real_txt_lens[req_idx])
-            req_out = joint_hidden_states[cu_seqlens[req_idx] : cu_seqlens[req_idx + 1]]
-            text_outputs[req_idx] = req_out[:txt_len].unsqueeze(0)
-            image_output = req_out[txt_len:].reshape(
-                chunk_end - chunk_start,
-                chunk_size,
-                self.query_num_heads,
-                self.head_dim,
+        varlen_backend = hasattr(getattr(self.attn, "attention", None), "_forward_varlen_flat")
+        if varlen_backend:
+            cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=joint_query.device)
+            attn_metadata = AttentionMetadata(
+                is_varlen=True,
+                q_cu_seqlens=cu_seqlens_tensor,
+                kv_cu_seqlens=cu_seqlens_tensor,
+                max_q_len=max_seq_len,
+                max_kv_len=max_seq_len,
+                padded_tokens=0,
             )
-            for local_chunk_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
-                image_outputs[chunk_idx] = image_output[local_chunk_idx : local_chunk_idx + 1]
+            joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
+
+            for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
+                txt_len = int(real_txt_lens[req_idx])
+                req_out = joint_hidden_states[cu_seqlens[req_idx] : cu_seqlens[req_idx + 1]]
+                text_outputs[req_idx] = req_out[:txt_len].unsqueeze(0)
+                image_output = req_out[txt_len:].reshape(
+                    chunk_end - chunk_start,
+                    chunk_size,
+                    self.query_num_heads,
+                    self.head_dim,
+                )
+                for local_chunk_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
+                    image_outputs[chunk_idx] = image_output[local_chunk_idx : local_chunk_idx + 1]
+        else:
+            # The selected backend cannot handle flat varlen inputs. Fall back
+            # to per-request dense attention: run each request independently
+            # with its own text + image sequence so any dense backend works.
+            dense_metadata = AttentionMetadata()
+            for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
+                txt_len = int(real_txt_lens[req_idx])
+                req_query = flat_queries[req_idx].unsqueeze(0)
+                req_key = flat_keys[req_idx].unsqueeze(0)
+                req_value = flat_values[req_idx].unsqueeze(0)
+                req_cos = flat_cos[req_idx].unsqueeze(0)
+                req_sin = flat_sin[req_idx].unsqueeze(0)
+                req_query = self.rope(req_query.float(), req_cos, req_sin).to(req_query.dtype)
+                req_key = self.rope(req_key.float(), req_cos, req_sin).to(req_key.dtype)
+                req_out = self.attn(req_query, req_key, req_value, dense_metadata)
+                text_outputs[req_idx] = req_out[:, :txt_len]
+                image_output = req_out[:, txt_len:].reshape(
+                    chunk_end - chunk_start,
+                    chunk_size,
+                    self.query_num_heads,
+                    self.head_dim,
+                )
+                for local_chunk_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
+                    image_outputs[chunk_idx] = image_output[local_chunk_idx : local_chunk_idx + 1]
 
         # Re-pad per-request text outputs to the padded text length so the
         # residual add and downstream text projections stay shape-compatible.
@@ -1079,6 +1102,7 @@ class QwenImageTransformerBlock(nn.Module):
         text_freqs: torch.Tensor,
         chunk_to_request: torch.Tensor,
         request_chunk_ranges: list[tuple[int, int]],
+        real_txt_lens: list[int],
         encoder_hidden_states_mask: torch.Tensor | None,
         temb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1102,6 +1126,7 @@ class QwenImageTransformerBlock(nn.Module):
             text_freqs=text_freqs,
             chunk_to_request=chunk_to_request,
             request_chunk_ranges=request_chunk_ranges,
+            real_txt_lens=real_txt_lens,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
         )
 
@@ -1369,6 +1394,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
 
+        if encoder_hidden_states_mask is not None:
+            real_txt_lens = encoder_hidden_states_mask.sum(dim=1).tolist()
+        else:
+            real_txt_lens = [seq_len_txt] * encoder_hidden_states.shape[0]
+
         for block in self.transformer_blocks:
             encoder_hidden_states, image_chunks_tensor = block.forward_mixfusion(
                 image_chunks=image_chunks_tensor,
@@ -1377,6 +1407,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 text_freqs=text_freqs_tensor,
                 chunk_to_request=chunk_to_request_tensor,
                 request_chunk_ranges=request_chunk_ranges,
+                real_txt_lens=real_txt_lens,
                 encoder_hidden_states_mask=encoder_hidden_states_mask,
                 temb=temb,
             )
