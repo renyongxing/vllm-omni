@@ -1389,7 +1389,25 @@ class QwenImageTransformer2DModel(CachedTransformer):
         if img_shapes is None or txt_seq_lens is None:
             raise ValueError("Qwen MixFusion requires img_shapes and txt_seq_lens.")
 
-        chunk_size = self._mixfusion_chunk_size(hidden_states)
+        # Expand each state's latents into one row per requested image so that every
+        # image gets its own prompt row (encoder_hidden_states / temb are already
+        # per-image) and its own chunk mapping.
+        image_rows: list[torch.Tensor] = []
+        image_row_states: list[int] = []
+        total_images = 0
+        for state_idx, sample in enumerate(hidden_states):
+            for img_idx in range(int(sample.shape[0])):
+                image_rows.append(sample[img_idx : img_idx + 1])
+                image_row_states.append(state_idx)
+            total_images += int(sample.shape[0])
+
+        if total_images != int(encoder_hidden_states.shape[0]):
+            raise ValueError(
+                f"Qwen MixFusion prompt rows ({encoder_hidden_states.shape[0]}) do not "
+                f"match total requested images ({total_images})."
+            )
+
+        chunk_size = self._mixfusion_chunk_size(image_rows)
         image_chunks: list[torch.Tensor] = []
         image_freq_chunks: list[torch.Tensor] = []
         chunk_to_request: list[int] = []
@@ -1397,7 +1415,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         seq_len_txt = int(encoder_hidden_states.shape[1])
         text_freqs: list[torch.Tensor] = []
 
-        for req_idx, sample in enumerate(hidden_states):
+        for row_idx, sample in enumerate(image_rows):
             seq_len = int(sample.shape[1])
             if seq_len % chunk_size != 0:
                 raise ValueError(f"Qwen MixFusion seq_len={seq_len} is not divisible by chunk_size={chunk_size}.")
@@ -1405,9 +1423,12 @@ class QwenImageTransformer2DModel(CachedTransformer):
             image_chunks.extend(sample.split(chunk_size, dim=1))
             chunk_end = len(image_chunks)
             request_chunk_ranges.append((chunk_start, chunk_end))
-            chunk_to_request.extend([req_idx] * (chunk_end - chunk_start))
+            chunk_to_request.extend([row_idx] * (chunk_end - chunk_start))
 
-            req_vid_freqs, req_txt_freqs = self.pos_embed(img_shapes[req_idx], [seq_len_txt], device=sample.device)
+            # img_shapes / txt_seq_lens are per-state; images of the same request
+            # share the same resolution and prompt.
+            state_idx = image_row_states[row_idx]
+            req_vid_freqs, req_txt_freqs = self.pos_embed(img_shapes[state_idx], [seq_len_txt], device=sample.device)
             image_freq_chunks.extend(req_vid_freqs.split(chunk_size, dim=0))
             text_freqs.append(req_txt_freqs[:seq_len_txt])
 
@@ -1455,9 +1476,22 @@ class QwenImageTransformer2DModel(CachedTransformer):
         image_chunks_tensor = self.norm_out(image_chunks_tensor, chunk_temb)
         image_chunks_tensor = self.proj_out(image_chunks_tensor)
 
+        # Reassemble outputs per request: each request owns num_images image rows,
+        # whose chunks are contiguous in request_chunk_ranges. Rebuild the
+        # [num_images, seq, C] latent per request to preserve the external
+        # contract (one tensor per request).
         outputs: list[torch.Tensor] = []
-        for chunk_start, chunk_end in request_chunk_ranges:
-            outputs.append(image_chunks_tensor[chunk_start:chunk_end].reshape(1, -1, image_chunks_tensor.shape[-1]))
+        row_idx = 0
+        for sample in hidden_states:
+            num_images = int(sample.shape[0])
+            rows = []
+            for _ in range(num_images):
+                chunk_start, chunk_end = request_chunk_ranges[row_idx]
+                row_idx += 1
+                rows.append(
+                    image_chunks_tensor[chunk_start:chunk_end].reshape(1, -1, image_chunks_tensor.shape[-1])
+                )
+            outputs.append(torch.cat(rows, dim=0) if num_images > 1 else rows[0])
         return outputs
 
     def forward(

@@ -930,7 +930,9 @@ class QwenImagePipeline(
         chunk_size = int(latents[0].shape[1])
         for sample in latents[1:]:
             chunk_size = math.gcd(chunk_size, int(sample.shape[1]))
-        chunk_count = sum(int(sample.shape[1]) // chunk_size for sample in latents)
+        chunk_count = sum(
+            int(sample.shape[1]) // chunk_size * int(sample.shape[0]) for sample in latents
+        )
         if chunk_size < min_chunk_tokens:
             return False, f"chunk_size={chunk_size} < min_chunk_tokens={min_chunk_tokens}", chunk_size, chunk_count
         if chunk_count > max_chunks:
@@ -943,14 +945,18 @@ class QwenImagePipeline(
             raise TypeError("_denoise_step_serial_ragged expects list latents.")
 
         outputs: list[torch.Tensor] = []
+        offset = 0
         for req_idx, sample_latents in enumerate(latents):
-            prompt_embeds = input_batch.prompt_embeds[req_idx : req_idx + 1]
+            # prompt_embeds / guidance / negative prompts are per-image rows, while
+            # latents is one tensor per request (which may hold num_images rows).
+            num_images = int(sample_latents.shape[0])
+            prompt_embeds = input_batch.prompt_embeds[offset : offset + num_images]
             prompt_embeds_mask = (
                 None
                 if input_batch.prompt_embeds_mask is None
-                else input_batch.prompt_embeds_mask[req_idx : req_idx + 1]
+                else input_batch.prompt_embeds_mask[offset : offset + num_images]
             )
-            guidance = None if input_batch.guidance is None else input_batch.guidance[req_idx : req_idx + 1]
+            guidance = None if input_batch.guidance is None else input_batch.guidance[offset : offset + num_images]
             positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
                 latents=sample_latents,
                 timestep=input_batch.timesteps[req_idx : req_idx + 1],
@@ -963,12 +969,12 @@ class QwenImagePipeline(
                 negative_prompt_embeds=(
                     None
                     if input_batch.negative_prompt_embeds is None
-                    else input_batch.negative_prompt_embeds[req_idx : req_idx + 1]
+                    else input_batch.negative_prompt_embeds[offset : offset + num_images]
                 ),
                 negative_prompt_embeds_mask=(
                     None
                     if input_batch.negative_prompt_embeds_mask is None
-                    else input_batch.negative_prompt_embeds_mask[req_idx : req_idx + 1]
+                    else input_batch.negative_prompt_embeds_mask[offset : offset + num_images]
                 ),
                 negative_txt_seq_lens=(
                     None if input_batch.negative_txt_seq_lens is None else [input_batch.negative_txt_seq_lens[req_idx]]
@@ -979,6 +985,7 @@ class QwenImagePipeline(
                     "return_dict": False,
                 },
             )
+            offset += num_images
             outputs.append(
                 self.predict_noise_maybe_with_cfg(
                     input_batch.do_true_cfg,
