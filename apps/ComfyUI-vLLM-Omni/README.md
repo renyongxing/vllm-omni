@@ -52,6 +52,7 @@ This extension offers the following nodes based on the output modalities (at **C
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
+- **Generate Music** for lyrics-and-description-to-music generation
 
 This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
 
@@ -213,6 +214,15 @@ Record the server commit, model/adapter, input assets, prompt, settings, and out
 alongside the result. Local schema or mocked-server checks do not establish H3
 generation quality or replace this real-model validation.
 
+### MiniMax H3 Text to Video
+
+Import [the H3 text-to-video template](example_workflows/MiniMax_H3_Text_to_Video.json)
+for remote video generation with audio. It includes connected base presets and
+optional Turbo sampling, H3 parameters, and Remote LoRA nodes. See the
+[workflow guide](docs/minimax-h3-t2v.md) for server setup, artifact-specific Turbo
+settings, and saved-video/audio validation. Set Remote LoRA’s `local_path` to
+the downloaded Turbo artifact on your server before enabling Turbo.
+
 #### H3 video upscale (WF-07)
 
 The **vLLM-Omni MiniMax H3 Video Upscale** template generates video remotely, upscales it with SeedVR2, and saves the original and upscaled videos with the generated audio and FPS. See [workflow setup](docs/wf07-h3-upscale.md).
@@ -264,6 +274,17 @@ The node records which server the workflow targets; it does not start one, nor s
 
 > [!TIP]
 > There is a dedicated node for VoiceClone tasks with reference audio input. Other simple text-to-speech tasks should use the regular TTS node.
+
+### Music generation (e.g., MiniMax Music 3)
+
+(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Generation**)
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg">
+    <img alt="vLLM-Omni Music Generation" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg" width=55%>
+  </picture>
+</p>
 
 ### Chaining multiple model services
 

@@ -19,6 +19,7 @@ from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import vllm.envs as envs
@@ -440,21 +441,34 @@ async def build_async_omni(
         yield async_omni
 
 
-def _is_duplex_model(model: str, kwargs: dict[str, Any]) -> bool:
-    """Whether ``model``'s pipeline declares a ``duplex_plugin`` (served by ``DuplexOmni``).
-
-    Resolution errors propagate: a duplex model whose pipeline or deploy
-    config cannot be resolved must fail startup rather than silently start a
-    turn-based server.
-    """
+def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
+    """Select the serving engine without changing the model's duplex capability."""
     from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.config.stage_config import _DEPLOY_DIR, resolve_deploy_yaml
 
     pipeline_config = StageConfigFactory.get_pipeline_config(
         model=model,
         trust_remote_code=bool(kwargs.get("trust_remote_code")),
         deploy_config_path=kwargs.get("deploy_config"),
     )
-    return bool(pipeline_config is not None and getattr(pipeline_config, "duplex_plugin", None))
+    if pipeline_config is None or not getattr(pipeline_config, "duplex_plugin", None):
+        return False
+
+    deploy_path = kwargs.get("deploy_config")
+    if deploy_path is None:
+        if pipeline_config.default_deploy_config_name is None:
+            raise ValueError("A duplex-capable model requires a deploy config with session_mode: turn or duplex")
+        deploy_path = _DEPLOY_DIR / pipeline_config.default_deploy_config_name
+    else:
+        deploy_path = Path(deploy_path)
+        if not deploy_path.exists() and deploy_path.parent == Path("."):
+            deploy_path = _DEPLOY_DIR / deploy_path
+
+    # Resolve base_config too, so the API and stage workers use the same mode.
+    session_mode = resolve_deploy_yaml(deploy_path).get("session_mode")
+    if session_mode not in ("turn", "duplex"):
+        raise ValueError("A duplex-capable model requires session_mode: turn or duplex in its deploy config")
+    return session_mode == "duplex"
 
 
 @asynccontextmanager
@@ -518,9 +532,7 @@ async def build_async_omni_from_stage_config(
         kwargs.pop("robot_openpi_idle_timeout", None)
         model = kwargs.pop("model", None) or args.model
         kwargs.setdefault("log_stats", not args.disable_log_stats)
-        if _is_duplex_model(model, kwargs):
-            # A duplex model is always served in duplex mode: sessions over
-            # /v1/realtime?duplex=1, no turn-based HTTP routes.
+        if _should_serve_duplex(model, kwargs):
             async_omni = DuplexOmni(model=model, **kwargs)
         else:
             async_omni = AsyncOmni(model=model, **kwargs)
@@ -712,9 +724,7 @@ async def omni_init_app_state(
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
 
-    # Duplex mode: a duplex model is served through DuplexOmni only. Sessions
-    # run over /v1/realtime?duplex=1; every turn-based HTTP route reports
-    # "not available".
+    # Initialize the API surface for the selected engine, not just the model.
     if isinstance(engine_client, DuplexOmni):
         await _init_duplex_app_state(engine_client, state, args, base_model_paths, vllm_config, request_logger)
         return
