@@ -1488,9 +1488,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             for _ in range(num_images):
                 chunk_start, chunk_end = request_chunk_ranges[row_idx]
                 row_idx += 1
-                rows.append(
-                    image_chunks_tensor[chunk_start:chunk_end].reshape(1, -1, image_chunks_tensor.shape[-1])
-                )
+                rows.append(image_chunks_tensor[chunk_start:chunk_end].reshape(1, -1, image_chunks_tensor.shape[-1]))
             outputs.append(torch.cat(rows, dim=0) if num_images > 1 else rows[0])
         return outputs
 

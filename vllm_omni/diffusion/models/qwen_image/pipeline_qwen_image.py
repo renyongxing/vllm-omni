@@ -930,9 +930,7 @@ class QwenImagePipeline(
         chunk_size = int(latents[0].shape[1])
         for sample in latents[1:]:
             chunk_size = math.gcd(chunk_size, int(sample.shape[1]))
-        chunk_count = sum(
-            int(sample.shape[1]) // chunk_size * int(sample.shape[0]) for sample in latents
-        )
+        chunk_count = sum(int(sample.shape[1]) // chunk_size * int(sample.shape[0]) for sample in latents)
         if chunk_size < min_chunk_tokens:
             return False, f"chunk_size={chunk_size} < min_chunk_tokens={min_chunk_tokens}", chunk_size, chunk_count
         if chunk_count > max_chunks:
