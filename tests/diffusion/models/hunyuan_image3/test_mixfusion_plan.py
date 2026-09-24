@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
+
+import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.mixfusion import (
     build_mixfusion_sequence_plan,
     validate_mixfusion_sequence_plan,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def test_mixfusion_rejects_small_gcd_many_chunks() -> None:
