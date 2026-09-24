@@ -957,7 +957,7 @@ class QwenImagePipeline(
             guidance = None if input_batch.guidance is None else input_batch.guidance[offset : offset + num_images]
             positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
                 latents=sample_latents,
-                timestep=input_batch.timesteps[req_idx : req_idx + 1],
+                timestep=input_batch.timesteps[offset : offset + num_images],
                 guidance=guidance,
                 prompt_embeds=prompt_embeds,
                 prompt_embeds_mask=prompt_embeds_mask,

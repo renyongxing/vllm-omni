@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -770,6 +771,25 @@ class QwenImageCrossAttention(nn.Module):
 
         return img_attn_output, txt_attn_output
 
+    def _supports_flat_varlen_attention(self) -> bool:
+        """Whether self.attn actually dispatches packed multi-document varlen.
+
+        ``FlashAttentionImpl._forward_varlen_flat`` exists on every platform,
+        but only forward_cuda/forward_xpu honor ``AttentionMetadata.is_varlen``.
+        NPU's forward ignores it (mindiesd path + two-document npu_attn_varlen
+        contract), so packed N-document Q/K/V there would attend across
+        request boundaries.
+        """
+        if not hasattr(getattr(self.attn, "attention", None), "_forward_varlen_flat"):
+            return False
+        if current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa():
+            return True
+        if current_omni_platform.is_xpu():
+            from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+
+            return flash_attn_varlen_func is not None
+        return False
+
     def forward_mixfusion(
         self,
         image_chunks: torch.Tensor,
@@ -869,7 +889,7 @@ class QwenImageCrossAttention(nn.Module):
         joint_query = self.rope(joint_query.float(), joint_cos, joint_sin).to(joint_query.dtype)
         joint_key = self.rope(joint_key.float(), joint_cos, joint_sin).to(joint_key.dtype)
 
-        varlen_backend = hasattr(getattr(self.attn, "attention", None), "_forward_varlen_flat")
+        varlen_backend = self._supports_flat_varlen_attention()
         if varlen_backend:
             cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=joint_query.device)
             attn_metadata = AttentionMetadata(
