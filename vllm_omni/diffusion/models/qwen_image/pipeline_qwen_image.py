@@ -1016,8 +1016,10 @@ class QwenImagePipeline(
         min_chunk_tokens = 256
         max_chunks = 128
         if request_extras:
-            min_chunk_tokens = int(request_extras[0].get("mixfusion_min_chunk_tokens", min_chunk_tokens))
-            max_chunks = int(request_extras[0].get("mixfusion_max_chunks", max_chunks))
+            # Aggregate conservatively so no request's limits are violated by the
+            # fused pass: the strictest per-request thresholds govern the batch.
+            min_chunk_tokens = max(int(e.get("mixfusion_min_chunk_tokens", 256)) for e in request_extras)
+            max_chunks = min(int(e.get("mixfusion_max_chunks", 128)) for e in request_extras)
         accepted, reason, chunk_size, chunk_count = self._qwen_mixfusion_candidate(
             latents,
             min_chunk_tokens=min_chunk_tokens,

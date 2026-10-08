@@ -1236,7 +1236,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             self.input_batch = input_batch
             scatter_latents(states, input_batch)
             for state in states:
-                if interrupted or state.denoise_completed:
+                if interrupted or state.request_denoise_completed:
                     self.state_cache.pop(state.request_id, None)
             return
 
