@@ -984,7 +984,15 @@ class QwenImagePipeline(
                 negative_txt_seq_lens=(
                     None if input_batch.negative_txt_seq_lens is None else [input_batch.negative_txt_seq_lens[req_idx]]
                 ),
-                image_latents=None,
+                # image_latents is per-image rows like the prompts: slice this
+                # request's rows so ragged requests keep their condition image.
+                # The dense denoise_step passes them straight through; dropping
+                # them here would silently denoise edits without the condition.
+                image_latents=(
+                    None
+                    if input_batch.image_latents is None
+                    else input_batch.image_latents[offset : offset + num_images]
+                ),
                 extra_transformer_kwargs={
                     "attention_kwargs": self.attention_kwargs,
                     "return_dict": False,

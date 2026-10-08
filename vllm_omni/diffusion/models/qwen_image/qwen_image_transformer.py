@@ -892,12 +892,15 @@ class QwenImageCrossAttention(nn.Module):
         # to drop), so per-chunk/per-request frequencies are preserved exactly.
         # Replaces the unfused torch path (mul/neg/cat elementwise, 4 calls)
         # with one fused Triton kernel per q/k.
-        # Keep RoPE frequencies in FP32 for precision. The vLLM fused kernel
-        # requires query/key and cos/sin to share a dtype, so promote the
-        # rotated tensors to FP32 and cast only the outputs back to the
-        # original query/key dtype.
-        joint_query = self.rope(joint_query.float(), joint_cos, joint_sin).to(joint_query.dtype)
-        joint_key = self.rope(joint_key.float(), joint_cos, joint_sin).to(joint_key.dtype)
+        # Match the eager-path contract (_qwen_image_qk_norm_rope): cos/sin
+        # cast to the activation dtype before rotating activation-dtype q/k.
+        # FP32 rotary numerics drop Omni-vs-Diffusers PSNR below the gate
+        # (#7494), so this branch must not diverge from the default forward --
+        # chunk acceptance must not change pixels for the same request.
+        joint_cos = joint_cos.to(joint_query.dtype)
+        joint_sin = joint_sin.to(joint_query.dtype)
+        joint_query = self.rope(joint_query, joint_cos, joint_sin)
+        joint_key = self.rope(joint_key, joint_cos, joint_sin)
 
         varlen_backend = self._supports_flat_varlen_attention()
         if varlen_backend:
@@ -934,10 +937,10 @@ class QwenImageCrossAttention(nn.Module):
                 req_query = flat_queries[req_idx].unsqueeze(0)
                 req_key = flat_keys[req_idx].unsqueeze(0)
                 req_value = flat_values[req_idx].unsqueeze(0)
-                req_cos = flat_cos[req_idx].unsqueeze(0)
-                req_sin = flat_sin[req_idx].unsqueeze(0)
-                req_query = self.rope(req_query.float(), req_cos, req_sin).to(req_query.dtype)
-                req_key = self.rope(req_key.float(), req_cos, req_sin).to(req_key.dtype)
+                req_cos = flat_cos[req_idx].unsqueeze(0).to(req_query.dtype)
+                req_sin = flat_sin[req_idx].unsqueeze(0).to(req_query.dtype)
+                req_query = self.rope(req_query, req_cos, req_sin)
+                req_key = self.rope(req_key, req_cos, req_sin)
                 req_out = self.attn(req_query, req_key, req_value, dense_metadata)
                 text_outputs[req_idx] = req_out[:, :txt_len]
                 image_output = req_out[:, txt_len:].reshape(
