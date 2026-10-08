@@ -1478,6 +1478,87 @@ This release supports T2VA only, with local or pure Ulysses attention. Additiona
 LoRA adapters, Ref2VA and FL2VA conditioning are unsupported. The legacy
 four-step adapter keeps its original sampling and fixed-top-k behavior.
 
+### VDN-H3 checkpoint
+
+[VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) is an 8-step DMD student of
+the FL2VA partition. Each DiT block replaces dense self-attention with an exact
+softmax over a frame window plus a Video DeltaNet linear branch for the frames
+outside it. The `VDNH3_ATTN` backend runs the window; see
+[VDN-H3 Hybrid Attention](../../docs/user_guide/diffusion/attention_backends/vdnh3_attn.md)
+for the window layout. The release's two LoRA adapters are fused into the H3
+weights as they stream in, and the linear-branch weights are attached to the
+DiT blocks.
+
+Pass the release as `--lora-path`. Only its `stage-dmd-step-250/` directory
+(about 5 GB) is downloaded; a local copy of the release or of that directory
+also works:
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+vllm serve MiniMaxAI/MiniMax-H3 --omni \
+  --trust-remote-code \
+  --task-type fl2va \
+  --lora-path OpenVDN/vdn-minimax-h3 \
+  --diffusion-attention-backend VDNH3_ATTN \
+  --tensor-parallel-size 2 \
+  --text-encoder-tp-size 2 \
+  --vae-patch-parallel-size 2
+```
+
+Requests use 8 steps and task `t2va` or `fl2va`:
+
+```bash
+-F 'num_inference_steps=8' \
+-F 'extra_params={"task":"t2va","duration":5}'
+```
+
+FL2VA takes a first frame, a last frame, or both, with the same
+`frame_indices` forms as
+[FL2VA for base H3](#2-fl2va-first-frame-to-video-and-audio).
+
+The student was distilled at 8 steps with H3's default video/audio shifts of
+12/3 and the Euler sampler. A request with another step count, a shift
+override, `sampler=res_multistep`, or a `lora=` field is rejected. Add
+`--quantization fp8` to run the DiT and text-encoder linears in FP8, including
+the linear branch's output projection.
+
+`VDNH3_ATTN` and the checkpoint must be selected together, and the server must
+use `--task-type fl2va`. VDN-H3 scales with tensor parallelism only: `--usp`
+and `--ring` are rejected. Distributed layerwise offload is rejected because it
+installs the DiT without the load-time fusion. The startup log confirms the
+fusion:
+
+```text
+VDN-H3 stage-dmd-step-250: fused 259 LoRA targets, loaded 800 branch tensors
+```
+
+Tensor-parallel sizes 1 (with `--enable-cpu-offload`), 2, and 8 were run end to
+end on NVIDIA H200 (141 GB, NVLink), with T2VA and with all three FL2VA
+keyframe forms at TP2. Cache acceleration, step execution, and
+latent upscale/refine have not been run with VDN-H3.
+
+Measured on H200 at 1344x768 and 14.375 s (345 frames, about 104k tokens) for
+one T2VA prompt with seed 1000, using the offline API and
+`--vae-patch-parallel-size` equal to the TP size. Compilation is on, the first
+request is excluded as warm-up, and one request was recorded per row. DiT time
+per step is the mean of steps 2-8:
+
+| GPUs | Configuration | DiT time per step | End-to-end |
+| ---: | --- | ---: | ---: |
+| 2 | VDN-H3, BF16 | 8.2 s | 74.6 s |
+| 2 | VDN-H3, FP8 | 7.2 s | 67.9 s |
+| 2 | Base H3, `FLASH_ATTN`, 8 steps, BF16 | 15.4 s | 132.4 s |
+| 8 | VDN-H3, BF16 | 2.9 s | 28.8 s |
+| 8 | VDN-H3, FP8 | 2.8 s | 27.9 s |
+| 8 | Base H3, `FLASH_ATTN`, 8 steps, BF16 | 4.4 s | 41.0 s |
+
+The base H3 rows only isolate the attention cost; base H3 is not distilled for
+8 steps. For correctness, the first eager DiT forward was replayed through the
+OpenVDN reference implementation on identical inputs. The relative L2 error
+was 1.6e-2 for video and 1.0e-2 for audio, against 1.2e-2 and 1.4e-2 for base
+H3 replayed the same way. Software: Ubuntu 22.04, driver 580.178.04, Python
+3.12, PyTorch 2.13.0+cu130, vLLM 0.30.0.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
