@@ -163,16 +163,10 @@ def test_forward_mixfusion_packs_mixed_requests_into_one_flat_sequence():
     image_chunks, encoder_hidden_states, *_ = _mixfusion_inputs()
 
     def _txt_rows(req_idx):
-        return encoder_hidden_states[req_idx, : REAL_TXT_LENS[req_idx], :Q_SIZE].unflatten(
-            -1, (HEADS, HEAD_DIM)
-        )
+        return encoder_hidden_states[req_idx, : REAL_TXT_LENS[req_idx], :Q_SIZE].unflatten(-1, (HEADS, HEAD_DIM))
 
     def _img_rows(chunk_start, chunk_end):
-        return (
-            image_chunks[chunk_start:chunk_end]
-            .reshape(-1, QKV_DIM)[:, :Q_SIZE]
-            .unflatten(-1, (HEADS, HEAD_DIM))
-        )
+        return image_chunks[chunk_start:chunk_end].reshape(-1, QKV_DIM)[:, :Q_SIZE].unflatten(-1, (HEADS, HEAD_DIM))
 
     offset = 0
     for req_idx, (chunk_start, chunk_end) in enumerate(REQUEST_CHUNK_RANGES):
