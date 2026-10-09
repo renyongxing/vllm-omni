@@ -670,6 +670,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             flash_attn_varlen_func,
         )
 
+        if flash_attn_varlen_func is None:
+            raise ImportError("Flat variable-length attention requires flash_attn_varlen_func")
         if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
             raise ValueError("Flat varlen FlashAttention expects [total_tokens, heads, head_dim] Q/K/V.")
         if attn_metadata.attn_mask is not None or attn_metadata.joint_attn_mask is not None:
@@ -722,6 +724,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         extra = metadata_plan.extra
 
         if attn_metadata is not None and attn_metadata.is_varlen:
+            self._warn_fa_deterministic_non_dense("flat-varlen")
             return self._forward_varlen_flat(query, key, value, attn_metadata)
 
         # Try piecewise attention
@@ -827,6 +830,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
 
         if attn_metadata is not None and attn_metadata.is_varlen:
+            self._warn_fa_deterministic_non_dense("flat-varlen")
             return self._forward_varlen_flat(query, key, value, attn_metadata)
 
         if attention_mask is not None and torch.any(~attention_mask):

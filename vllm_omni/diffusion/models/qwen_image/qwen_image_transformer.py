@@ -792,13 +792,11 @@ class QwenImageCrossAttention(nn.Module):
         """
         if not hasattr(getattr(self.attn, "attention", None), "_forward_varlen_flat"):
             return False
-        if current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa():
-            return True
-        if current_omni_platform.is_xpu():
-            from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
 
+        if current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa():
             return flash_attn_varlen_func is not None
-        return False
+        return current_omni_platform.is_xpu() and flash_attn_varlen_func is not None
 
     def forward_mixfusion(
         self,
