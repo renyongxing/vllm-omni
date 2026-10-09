@@ -3,7 +3,9 @@
 """Tests for the MixFusion batch-key shape relaxation (CPU).
 
 ``enable_mixfusion`` packs requests of different resolutions into one denoise step
-batch, so ``height``/``width``/``resolution`` must stop splitting the batch key.
+batch, so ``height``/``width``/``resolution`` must stop splitting the step-batch
+key. Request-mode batches still resolve one height/width for the whole batch
+from the first request's sampling params, so they keep resolution in their key.
 Requests that carry per-prompt ``additional_information`` cannot share a key at all,
 which both schedulers express by returning ``None``.
 """
@@ -55,17 +57,26 @@ def test_shape_still_splits_the_key_without_mixfusion(scheduler_cls):
     assert (key.height, key.width, key.resolution) == (1024, 768, 1024)
 
 
-@pytest.mark.parametrize("scheduler_cls", [_Scheduler, RequestScheduler])
-def test_mixfusion_drops_shape_from_the_key(scheduler_cls):
+def test_mixfusion_drops_shape_from_the_step_key():
     request = _request(["a cat"], extra_args={"enable_mixfusion": True})
     values = dict(SHAPE)
 
     assert _apply_mixfusion_shape_relaxation(request, values) is values
     assert values == {"height": None, "width": None, "resolution": None}
-    key = scheduler_cls()._build_sampling_params_key(request)
+    key = _Scheduler()._build_sampling_params_key(request)
     assert (key.height, key.width, key.resolution) == (None, None, None)
     # Other shape fields still participate, so mixfusion only relaxes resolution.
     assert key.num_frames == 1
+
+
+def test_mixfusion_keeps_shape_in_the_request_mode_key():
+    # The request-mode batch forward resolves one height/width for the whole
+    # batch from the first request's sampling params, so resolution must keep
+    # splitting the key until that path supports mixed shapes.
+    request = _request(["a cat"], extra_args={"enable_mixfusion": True})
+
+    key = RequestScheduler()._build_sampling_params_key(request)
+    assert (key.height, key.width, key.resolution) == (1024, 768, 1024)
 
 
 @pytest.mark.parametrize("scheduler_cls", [_Scheduler, RequestScheduler])

@@ -45,6 +45,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.hooks import module_has_active_hooks
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
@@ -1400,6 +1401,22 @@ class QwenImageTransformer2DModel(CachedTransformer):
             chunk_size = math.gcd(chunk_size, int(sample.shape[1]))
         return chunk_size
 
+    def has_active_block_hooks(self) -> bool:
+        """Whether any layerwise-offloadable block carries a registered hook.
+
+        ``_forward_mixfusion`` invokes ``block.forward_mixfusion`` directly,
+        which bypasses the HookRegistry wrapper installed around
+        ``block.forward``; hooks such as layerwise offload (block-weight
+        prefetch) would therefore never fire and offloaded blocks would run
+        with empty weight storage. Callers must fall back to the standard
+        forward path when this returns True.
+        """
+        for attr in self._layerwise_offload_blocks_attrs:
+            for block in getattr(self, attr, []):
+                if module_has_active_hooks(block):
+                    return True
+        return False
+
     def _forward_mixfusion(
         self,
         hidden_states: list[torch.Tensor],
@@ -1415,6 +1432,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
             raise ValueError("Qwen MixFusion does not support zero_cond_t/editing path yet.")
         if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
             raise ValueError("Qwen MixFusion requires sequence parallel disabled.")
+        if self.has_active_block_hooks():
+            raise ValueError(
+                "Qwen MixFusion packed forward bypasses block forward hooks "
+                "(e.g. layerwise offload); fall back to the standard forward path."
+            )
         if not hidden_states:
             raise ValueError("Qwen MixFusion requires at least one hidden-state tensor.")
         if img_shapes is None or txt_seq_lens is None:

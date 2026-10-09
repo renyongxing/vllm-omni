@@ -112,7 +112,11 @@ class RequestScheduler(BaseScheduler):
         """Build a request-batch compatibility key from sampling parameters."""
         key_kwargs = build_request_batch_sampling_params_key(request)
         values = {f.name: getattr(key_kwargs, f.name) for f in fields(key_kwargs)}
-        values = _apply_mixfusion_shape_relaxation(request, values)
+        # Request-mode batches resolve one height/width for the whole batch from
+        # the first request's sampling params, so mixed-resolution requests
+        # must not share a batch; keep resolution in the key (see
+        # QwenImagePipeline.forward).
+        values = _apply_mixfusion_shape_relaxation(request, values, relax_shapes=False)
         if values is None:
             return None
         return RequestBatchSamplingParamsKey(**values)

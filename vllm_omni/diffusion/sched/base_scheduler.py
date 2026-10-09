@@ -53,7 +53,12 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
 }
 
 
-def _apply_mixfusion_shape_relaxation(request: OmniDiffusionRequest, values: dict) -> dict | None:
+def _apply_mixfusion_shape_relaxation(
+    request: OmniDiffusionRequest,
+    values: dict,
+    *,
+    relax_shapes: bool = True,
+) -> dict | None:
     sampling = request.sampling_params
     extra_args = getattr(sampling, "extra_args", {}) or {}
     if not bool(extra_args.get("enable_mixfusion", False)):
@@ -61,6 +66,14 @@ def _apply_mixfusion_shape_relaxation(request: OmniDiffusionRequest, values: dic
 
     if any(isinstance(prompt, dict) and prompt.get("additional_information") for prompt in request.prompts):
         return None
+
+    if not relax_shapes:
+        # Only the step-execution batch handles mixed resolutions correctly
+        # (packed mixfusion and serial-ragged both resolve shapes per request).
+        # Request-mode batches run one full forward per batch whose height/width
+        # is resolved from the first request's sampling params, so resolution
+        # must keep splitting the key until that path supports mixed shapes.
+        return values
 
     values["height"] = None
     values["width"] = None

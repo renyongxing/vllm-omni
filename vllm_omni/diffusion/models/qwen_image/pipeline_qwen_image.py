@@ -1019,6 +1019,12 @@ class QwenImagePipeline(
             return self._denoise_step_serial_ragged(input_batch)
         if self.parallel_config.sequence_parallel_size > 1:
             return self._denoise_step_serial_ragged(input_batch)
+        # The packed mixfusion forward calls block.forward_mixfusion directly,
+        # bypassing the block forward hooks (e.g. layerwise offload prefetch).
+        # The serial path routes every block through the hooked module call,
+        # so it stays correct under those hooks.
+        if self.transformer.has_active_block_hooks():
+            return self._denoise_step_serial_ragged(input_batch)
 
         request_extras = input_batch.request_extras or []
         min_chunk_tokens = 256
