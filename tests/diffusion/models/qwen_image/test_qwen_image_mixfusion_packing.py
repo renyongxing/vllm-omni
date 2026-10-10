@@ -18,6 +18,7 @@ import torch
 
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageCrossAttention,
+    build_mixfusion_plan,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -86,6 +87,8 @@ def _mixfusion_module(*, flat_varlen: bool, rope: _CapturingRope):
         "norm_k": lambda t: t,
         "norm_added_q": lambda t: t,
         "norm_added_k": lambda t: t,
+        "qk_norm": True,
+        "eps": 1e-6,
         "rope": rope,
         "attn": fake_attn,
         "_supports_flat_varlen_attention": lambda: flat_varlen,
@@ -107,14 +110,20 @@ def _mixfusion_inputs():
 
 def _forward(module):
     image_chunks, encoder_hidden_states, image_freq_chunks, text_freqs, chunk_to_request = _mixfusion_inputs()
+    plan = build_mixfusion_plan(
+        seq_len_txt=SEQ_LEN_TXT,
+        chunk_size=CHUNK_SIZE,
+        request_chunk_ranges=REQUEST_CHUNK_RANGES,
+        real_txt_lens=REAL_TXT_LENS,
+        chunk_to_request=chunk_to_request,
+        device=image_chunks.device,
+    )
     return module.forward_mixfusion(
         image_chunks=image_chunks,
         encoder_hidden_states=encoder_hidden_states,
         image_freq_chunks=image_freq_chunks,
         text_freqs=text_freqs,
-        chunk_to_request=chunk_to_request,
-        request_chunk_ranges=REQUEST_CHUNK_RANGES,
-        real_txt_lens=REAL_TXT_LENS,
+        plan=plan,
     )
 
 

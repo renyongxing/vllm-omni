@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import lru_cache
 from math import prod
 from typing import TYPE_CHECKING, Any
@@ -113,6 +114,70 @@ def _qwen_image_qk_norm_rope(
     cos = torch.real(freqs).to(q.dtype)
     sin = torch.imag(freqs).to(q.dtype)
     return rope(q, cos, sin), rope(k, cos, sin)
+
+
+@dataclass
+class MixFusionPlan:
+    """Per-step MixFusion packing layout, computed once and shared by all blocks.
+
+    Holds the flat varlen sequence layout (cu_seqlens / max_seq_len) plus the
+    index tensors that recover per-request text rows and per-chunk image rows
+    from the packed attention output, so per-block work stays on-GPU.
+    """
+
+    cu_seqlens: list[int]
+    cu_seqlens_tensor: torch.Tensor
+    max_seq_len: int
+    request_chunk_ranges: list[tuple[int, int]]
+    real_txt_lens: list[int]
+    seq_len_txt: int
+    chunk_size: int
+    chunk_to_request: torch.Tensor
+    txt_out_idx: torch.Tensor
+    img_out_idx: torch.Tensor
+    # Target rows in the padded [num_requests * seq_len_txt] text-output space,
+    # or None when every request uses the full padded text length (no mask).
+    txt_pad_idx: torch.Tensor | None
+
+
+def build_mixfusion_plan(
+    *,
+    seq_len_txt: int,
+    chunk_size: int,
+    request_chunk_ranges: list[tuple[int, int]],
+    real_txt_lens: list[int],
+    chunk_to_request: torch.Tensor,
+    device: torch.device,
+) -> MixFusionPlan:
+    num_requests = len(request_chunk_ranges)
+    cu_seqlens = [0]
+    txt_out_rows: list[int] = []
+    img_out_rows: list[int] = []
+    txt_pad_rows: list[int] = []
+    max_seq_len = 0
+    for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
+        txt_len = int(real_txt_lens[req_idx])
+        img_len = (chunk_end - chunk_start) * chunk_size
+        base = cu_seqlens[-1]
+        txt_out_rows.extend(range(base, base + txt_len))
+        img_out_rows.extend(range(base + txt_len, base + txt_len + img_len))
+        cu_seqlens.append(base + txt_len + img_len)
+        max_seq_len = max(max_seq_len, txt_len + img_len)
+        txt_pad_rows.extend(range(req_idx * seq_len_txt, req_idx * seq_len_txt + txt_len))
+    needs_padding = any(int(l) < seq_len_txt for l in real_txt_lens)
+    return MixFusionPlan(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_tensor=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
+        max_seq_len=max_seq_len,
+        request_chunk_ranges=request_chunk_ranges,
+        real_txt_lens=real_txt_lens,
+        seq_len_txt=seq_len_txt,
+        chunk_size=chunk_size,
+        chunk_to_request=chunk_to_request,
+        txt_out_idx=torch.tensor(txt_out_rows, dtype=torch.long, device=device),
+        img_out_idx=torch.tensor(img_out_rows, dtype=torch.long, device=device),
+        txt_pad_idx=torch.tensor(txt_pad_rows, dtype=torch.long, device=device) if needs_padding else None,
+    )
 
 
 def _normalize_qwen_image_weight_name(name: str) -> str:
@@ -805,10 +870,7 @@ class QwenImageCrossAttention(nn.Module):
         encoder_hidden_states: torch.Tensor,
         image_freq_chunks: torch.Tensor,
         text_freqs: torch.Tensor,
-        chunk_to_request: torch.Tensor,
-        request_chunk_ranges: list[tuple[int, int]],
-        real_txt_lens: list[int],
-        encoder_hidden_states_mask: torch.Tensor | None = None,
+        plan: MixFusionPlan,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run Qwen joint attention with chunked image tokens and request-level text.
 
@@ -816,9 +878,8 @@ class QwenImageCrossAttention(nn.Module):
         MixFusion chunks for token-wise projections, then each request is
         recovered to ``text + full image`` immediately before attention so the
         attention semantics match independent dense execution.
+        ``plan`` carries the per-step packing layout shared by all blocks.
         """
-        if int(chunk_to_request.numel()) != int(image_chunks.shape[0]):
-            raise ValueError("chunk_to_request must have one entry per image chunk.")
 
         img_qkv, _ = self.to_qkv(image_chunks)
         q_size = self.query_num_heads * self.head_dim
@@ -838,136 +899,112 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
         txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-        img_query = self.norm_q(img_query)
-        img_key = self.norm_k(img_key)
-        txt_query = self.norm_added_q(txt_query)
-        txt_key = self.norm_added_k(txt_key)
-
-        # Per-token rotary frequencies laid out in MixFusion chunk order:
-        # [B_chunk, chunk_size, D/2] flattened to [B_chunk*chunk_size, D/2] so
-        # every image token carries its own (chunk-position, resolution) freq.
-        img_cos = image_freq_chunks.real.reshape(-1, image_freq_chunks.shape[-1])
-        img_sin = image_freq_chunks.imag.reshape(-1, image_freq_chunks.shape[-1])
-        txt_cos = text_freqs.real
-        txt_sin = text_freqs.imag
-
-        seq_len_txt = encoder_hidden_states.shape[1]
-        chunk_size = image_chunks.shape[1]
-        num_requests = encoder_hidden_states.shape[0]
-        text_outputs: list[torch.Tensor | None] = [None] * num_requests
-        image_outputs: list[torch.Tensor | None] = [None] * image_chunks.shape[0]
+        # Norm + rope before packing, sharing the fused Triton kernel with the
+        # standard forward path (same per-token math; RMS norm and rotary are
+        # per-token ops and commute with the concatenation). Keeps image
+        # freqs in [B_chunk, chunk_size, D/2] chunk order and text freqs in
+        # [num_requests, seq_len_txt, D/2] request order, so no flat cos/sin
+        # packing is needed.
+        img_query, img_key = _qwen_image_qk_norm_rope(
+            img_query, img_key, self.norm_q, self.norm_k, image_freq_chunks, self.rope, self.eps,
+            use_fused=self.qk_norm,
+        )
+        txt_query, txt_key = _qwen_image_qk_norm_rope(
+            txt_query, txt_key, self.norm_added_q, self.norm_added_k, text_freqs, self.rope, self.eps,
+        )
 
         flat_queries: list[torch.Tensor] = []
         flat_keys: list[torch.Tensor] = []
         flat_values: list[torch.Tensor] = []
-        flat_cos: list[torch.Tensor] = []
-        flat_sin: list[torch.Tensor] = []
-        cu_seqlens = [0]
-        max_seq_len = 0
-        for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
-            txt_len = int(real_txt_lens[req_idx])
-            image_seq_len = (chunk_end - chunk_start) * chunk_size
-            chunk_span = slice(chunk_start * chunk_size, chunk_end * chunk_size)
+        for req_idx, (chunk_start, chunk_end) in enumerate(plan.request_chunk_ranges):
+            txt_len = int(plan.real_txt_lens[req_idx])
             req_img_query = img_query[chunk_start:chunk_end].reshape(-1, self.query_num_heads, self.head_dim)
             req_img_key = img_key[chunk_start:chunk_end].reshape(-1, self.kv_num_heads, self.head_dim)
             req_img_value = img_value[chunk_start:chunk_end].reshape(-1, self.kv_num_heads, self.head_dim)
             flat_queries.append(torch.cat([txt_query[req_idx, :txt_len], req_img_query], dim=0))
             flat_keys.append(torch.cat([txt_key[req_idx, :txt_len], req_img_key], dim=0))
             flat_values.append(torch.cat([txt_value[req_idx, :txt_len], req_img_value], dim=0))
-            flat_cos.append(torch.cat([txt_cos[req_idx, :txt_len], img_cos[chunk_span]], dim=0))
-            flat_sin.append(torch.cat([txt_sin[req_idx, :txt_len], img_sin[chunk_span]], dim=0))
-            req_len = txt_len + image_seq_len
-            cu_seqlens.append(cu_seqlens[-1] + req_len)
-            max_seq_len = max(max_seq_len, req_len)
 
         joint_query = torch.cat(flat_queries, dim=0)
         joint_key = torch.cat(flat_keys, dim=0)
         joint_value = torch.cat(flat_values, dim=0)
-        joint_cos = torch.cat(flat_cos, dim=0)
-        joint_sin = torch.cat(flat_sin, dim=0)
-
-        # Fused rotary on the reassembled flat sequence. The vLLM fused kernel
-        # takes 2D per-token cos/sin indexed by flat position (no 3D batch dim
-        # to drop), so per-chunk/per-request frequencies are preserved exactly.
-        # Replaces the unfused torch path (mul/neg/cat elementwise, 4 calls)
-        # with one fused Triton kernel per q/k.
-        # Match the eager-path contract (_qwen_image_qk_norm_rope): cos/sin
-        # cast to the activation dtype before rotating activation-dtype q/k.
-        # FP32 rotary numerics drop Omni-vs-Diffusers PSNR below the gate
-        # (#7494), so this branch must not diverge from the default forward --
-        # chunk acceptance must not change pixels for the same request.
-        joint_cos = joint_cos.to(joint_query.dtype)
-        joint_sin = joint_sin.to(joint_query.dtype)
-        joint_query = self.rope(joint_query, joint_cos, joint_sin)
-        joint_key = self.rope(joint_key, joint_cos, joint_sin)
 
         varlen_backend = self._supports_flat_varlen_attention()
+        num_requests = encoder_hidden_states.shape[0]
         if varlen_backend:
-            cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=joint_query.device)
             attn_metadata = AttentionMetadata(
                 is_varlen=True,
-                q_cu_seqlens=cu_seqlens_tensor,
-                kv_cu_seqlens=cu_seqlens_tensor,
-                max_q_len=max_seq_len,
-                max_kv_len=max_seq_len,
+                q_cu_seqlens=plan.cu_seqlens_tensor,
+                kv_cu_seqlens=plan.cu_seqlens_tensor,
+                max_q_len=plan.max_seq_len,
+                max_kv_len=plan.max_seq_len,
                 padded_tokens=0,
             )
             joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
 
-            for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
-                txt_len = int(real_txt_lens[req_idx])
-                req_out = joint_hidden_states[cu_seqlens[req_idx] : cu_seqlens[req_idx + 1]]
-                text_outputs[req_idx] = req_out[:txt_len].unsqueeze(0)
-                image_output = req_out[txt_len:].reshape(
-                    chunk_end - chunk_start,
-                    chunk_size,
-                    self.query_num_heads,
-                    self.head_dim,
+            # Recover rows with one gather each: text rows in request order,
+            # image rows in chunk order. No mask -> the text gather is already
+            # the padded layout, just reshape; otherwise copy into a zero
+            # buffer at the precomputed padded positions.
+            txt_rows = joint_hidden_states.index_select(0, plan.txt_out_idx)
+            img_rows = joint_hidden_states.index_select(0, plan.img_out_idx)
+            if plan.txt_pad_idx is None:
+                txt_attn_output = txt_rows.view(
+                    num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim
                 )
-                for local_chunk_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
-                    image_outputs[chunk_idx] = image_output[local_chunk_idx : local_chunk_idx + 1]
+            else:
+                txt_buffer = txt_rows.new_zeros(
+                    num_requests * plan.seq_len_txt, self.add_query_num_heads, self.head_dim
+                )
+                txt_buffer.index_copy_(0, plan.txt_pad_idx, txt_rows)
+                txt_attn_output = txt_buffer.view(
+                    num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim
+                )
+            img_attn_output = img_rows.view(
+                image_chunks.shape[0], plan.chunk_size, self.query_num_heads, self.head_dim
+            )
         else:
             # The selected backend cannot handle flat varlen inputs. Fall back
             # to per-request dense attention: run each request independently
             # with its own text + image sequence so any dense backend works.
+            # q/k are already normed and rotated; flat_queries/keys carry the
+            # per-request "text + image" order.
             dense_metadata = AttentionMetadata()
-            for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
-                txt_len = int(real_txt_lens[req_idx])
-                req_query = flat_queries[req_idx].unsqueeze(0)
-                req_key = flat_keys[req_idx].unsqueeze(0)
-                req_value = flat_values[req_idx].unsqueeze(0)
-                req_cos = flat_cos[req_idx].unsqueeze(0).to(req_query.dtype)
-                req_sin = flat_sin[req_idx].unsqueeze(0).to(req_query.dtype)
-                req_query = self.rope(req_query, req_cos, req_sin)
-                req_key = self.rope(req_key, req_cos, req_sin)
-                req_out = self.attn(req_query, req_key, req_value, dense_metadata)
-                text_outputs[req_idx] = req_out[:, :txt_len]
+            text_outputs: list[torch.Tensor] = []
+            image_outputs: list[torch.Tensor | None] = [None] * image_chunks.shape[0]
+            for req_idx, (chunk_start, chunk_end) in enumerate(plan.request_chunk_ranges):
+                req_out = self.attn(
+                    flat_queries[req_idx].unsqueeze(0),
+                    flat_keys[req_idx].unsqueeze(0),
+                    flat_values[req_idx].unsqueeze(0),
+                    dense_metadata,
+                )
+                txt_len = int(plan.real_txt_lens[req_idx])
+                text_outputs.append(req_out[:, :txt_len])
                 image_output = req_out[:, txt_len:].reshape(
                     chunk_end - chunk_start,
-                    chunk_size,
+                    plan.chunk_size,
                     self.query_num_heads,
                     self.head_dim,
                 )
                 for local_chunk_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
                     image_outputs[chunk_idx] = image_output[local_chunk_idx : local_chunk_idx + 1]
 
-        # Re-pad per-request text outputs to the padded text length so the
-        # residual add and downstream text projections stay shape-compatible.
-        # Padded positions get zero output, identical to the mask-unpad path.
-        padded_text_outputs: list[torch.Tensor] = []
-        for req_idx in range(num_requests):
-            out = text_outputs[req_idx]
-            if out is None:
-                raise ValueError(f"Missing text attention output for request {req_idx}.")
-            if out.shape[1] < seq_len_txt:
-                out = torch.cat(
-                    [out, out.new_zeros((1, seq_len_txt - out.shape[1], out.shape[2], out.shape[3]))],
-                    dim=1,
-                )
-            padded_text_outputs.append(out)
+            # Re-pad per-request text outputs to the padded text length so the
+            # residual add and downstream text projections stay shape-compatible.
+            # Padded positions get zero output, identical to the mask-unpad path.
+            padded_text_outputs: list[torch.Tensor] = []
+            for req_idx in range(num_requests):
+                out = text_outputs[req_idx]
+                if out.shape[1] < plan.seq_len_txt:
+                    out = torch.cat(
+                        [out, out.new_zeros((1, plan.seq_len_txt - out.shape[1], out.shape[2], out.shape[3]))],
+                        dim=1,
+                    )
+                padded_text_outputs.append(out)
 
-        txt_attn_output = torch.cat(padded_text_outputs, dim=0)
-        img_attn_output = torch.cat([out for out in image_outputs if out is not None], dim=0)
+            txt_attn_output = torch.cat(padded_text_outputs, dim=0)
+            img_attn_output = torch.cat([out for out in image_outputs if out is not None], dim=0)
 
         txt_attn_output = txt_attn_output.flatten(2, 3).to(txt_query.dtype)
         img_attn_output = img_attn_output.flatten(2, 3).to(img_query.dtype)
@@ -1171,16 +1208,13 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         image_freq_chunks: torch.Tensor,
         text_freqs: torch.Tensor,
-        chunk_to_request: torch.Tensor,
-        request_chunk_ranges: list[tuple[int, int]],
-        real_txt_lens: list[int],
-        encoder_hidden_states_mask: torch.Tensor | None,
+        plan: MixFusionPlan,
         temb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         img_mod_params = self.img_mod(temb)
         txt_mod_params = self.txt_mod(temb)
 
-        img_mod_params = img_mod_params.index_select(0, chunk_to_request.to(img_mod_params.device))
+        img_mod_params = img_mod_params.index_select(0, plan.chunk_to_request)
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
 
@@ -1195,10 +1229,7 @@ class QwenImageTransformerBlock(nn.Module):
             encoder_hidden_states=txt_modulated,
             image_freq_chunks=image_freq_chunks,
             text_freqs=text_freqs,
-            chunk_to_request=chunk_to_request,
-            request_chunk_ranges=request_chunk_ranges,
-            real_txt_lens=real_txt_lens,
-            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            plan=plan,
         )
 
         image_chunks = image_chunks + img_gate1 * img_attn_output
@@ -1512,16 +1543,25 @@ class QwenImageTransformer2DModel(CachedTransformer):
         else:
             real_txt_lens = [seq_len_txt] * encoder_hidden_states.shape[0]
 
+        # Packing layout is identical across blocks and steps: build it once
+        # per forward (cu_seqlens / out-gather indices as device tensors) so
+        # the 60 blocks run pure GPU work.
+        plan = build_mixfusion_plan(
+            seq_len_txt=seq_len_txt,
+            chunk_size=chunk_size,
+            request_chunk_ranges=request_chunk_ranges,
+            real_txt_lens=real_txt_lens,
+            chunk_to_request=chunk_to_request_tensor,
+            device=image_chunks_tensor.device,
+        )
+
         for block in self.transformer_blocks:
             encoder_hidden_states, image_chunks_tensor = block.forward_mixfusion(
                 image_chunks=image_chunks_tensor,
                 encoder_hidden_states=encoder_hidden_states,
                 image_freq_chunks=image_freq_chunks_tensor,
                 text_freqs=text_freqs_tensor,
-                chunk_to_request=chunk_to_request_tensor,
-                request_chunk_ranges=request_chunk_ranges,
-                real_txt_lens=real_txt_lens,
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                plan=plan,
                 temb=temb,
             )
 
