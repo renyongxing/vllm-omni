@@ -91,7 +91,12 @@ def _qwen_image_qk_norm_rope(
     ):
         num_kv_heads = k.shape[2]
         rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
-        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
+        if rope_table.dim() == 3:
+            # Per-token freqs (mixfusion): every batch row carries its own
+            # positions, so no shared-table expand is needed.
+            rope_table = rope_table.reshape(tokens, rotary_dim)
+        else:
+            rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
         fused_q, fused_k = fused_qk_norm_rope(
             q.reshape(tokens, num_heads, head_dim),
             k.reshape(tokens, num_kv_heads, head_dim),
@@ -113,6 +118,22 @@ def _qwen_image_qk_norm_rope(
     k = norm_k(k)
     cos = torch.real(freqs).to(q.dtype)
     sin = torch.imag(freqs).to(q.dtype)
+    if cos.dim() == 3:
+        # Per-token freqs (mixfusion): each batch row has its own positions,
+        # but the rope kernels strip a 3-D cos down to cos[0] assuming a shared
+        # table — flatten to per-token rows so every row keeps its own angle.
+        kv_heads = k.shape[2]
+        q = rope(
+            q.reshape(tokens, num_heads, head_dim),
+            cos.reshape(tokens, -1),
+            sin.reshape(tokens, -1),
+        ).reshape(q.shape)
+        k = rope(
+            k.reshape(tokens, kv_heads, head_dim),
+            cos.reshape(tokens, -1),
+            sin.reshape(tokens, -1),
+        ).reshape(k.shape)
+        return q, k
     return rope(q, cos, sin), rope(k, cos, sin)
 
 
