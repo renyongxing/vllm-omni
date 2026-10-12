@@ -34,6 +34,7 @@ import asyncio
 import json
 import math
 import os
+import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -43,10 +44,27 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+# Some environments (sitecustomize.py, container images, .pth files) insert
+# other vllm-omni checkouts at the front of sys.path, which overrides
+# PYTHONPATH and would make both A/B sides import the same tree. When
+# VLLM_OMNI_ROOT names the intended checkout, drop every other sys.path entry
+# that carries a vllm_omni package and put it first instead.
+_VLLM_OMNI_ROOT = os.environ.get("VLLM_OMNI_ROOT")
+if _VLLM_OMNI_ROOT:
+    _root = os.path.realpath(_VLLM_OMNI_ROOT)
+    sys.path[:] = [
+        p
+        for p in sys.path
+        if os.path.realpath(p) == _root or not os.path.isfile(os.path.join(p, "vllm_omni", "__init__.py"))
+    ]
+    if _VLLM_OMNI_ROOT in sys.path:
+        sys.path.remove(_VLLM_OMNI_ROOT)
+    sys.path.insert(0, _VLLM_OMNI_ROOT)
+
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig  # noqa: E402
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine  # noqa: E402
+from vllm_omni.diffusion.request import OmniDiffusionRequest  # noqa: E402
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt  # noqa: E402
 
 DEFAULT_PROMPTS = [
     "A cinematic photo of a glass observatory on Mars at sunrise",
@@ -162,7 +180,7 @@ def make_config(args: argparse.Namespace, family: Family) -> OmniDiffusionConfig
         distributed_executor_backend=args.distributed_executor_backend,
         enforce_eager=args.enforce_eager,
         parallel_config=parallel_config,
-        quantization_config=args.quantization,
+        quantization_config=args.quantization or None,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         output_type=args.output_type,
         **family.config_fields(args),
@@ -188,6 +206,10 @@ def make_sampling_params(
         guidance_scale=args.guidance_scale,
         guidance_scale_provided=True,
         num_outputs_per_prompt=1,
+        # The pipeline reads output_type from the request's sampling params
+        # (pipeline_qwen_image.py: common_sampling_params.output_type), not
+        # from OmniDiffusionConfig.
+        output_type=args.output_type,
         extra_args=family.extra_args(args, enable_mixfusion),
         **family.sampling_fields,
     )
@@ -268,7 +290,7 @@ async def run_independent(
             prompts[idx : idx + 1],
             sizes[idx : idx + 1],
             f"independent-{idx}",
-            enable_mixfusion=family.independent_mixfusion,
+            enable_mixfusion=args.enable_mixfusion,
             seed_offset=idx,
         )
         elapsed, outputs = await run_requests(engine, requests)
@@ -312,6 +334,36 @@ def summarize_outputs(outputs: list[Any]) -> dict[str, Any]:
     }
 
 
+def dump_outputs(out_dir: Path, tag: str, outputs: list[Any]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    idx = 0
+    for output in outputs:
+        for image in getattr(output, "images", None) or []:
+            if isinstance(image, torch.Tensor):
+                torch.save(image.cpu(), out_dir / f"{tag}-{idx:03d}.pt")
+            else:
+                image.save(out_dir / f"{tag}-{idx:03d}.png")
+            idx += 1
+
+
+def _wait_for_traces(profile_dir: str, timeout_s: float = 120.0) -> list[str]:
+    """Wait until the workers' gzip trace dump has settled; return file list."""
+    deadline = time.monotonic() + timeout_s
+    known: set[str] = set()
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        files = {name for name in os.listdir(profile_dir) if not name.endswith(".tmp")}
+        if files and files == known:
+            stable_since = stable_since or time.monotonic()
+            if time.monotonic() - stable_since >= 5.0:
+                return sorted(os.path.join(profile_dir, name) for name in files)
+        else:
+            known = files
+            stable_since = None
+        time.sleep(1.0)
+    return sorted(os.path.join(profile_dir, name) for name in known)
+
+
 def validate_args(args: argparse.Namespace, family: Family, sizes: list[tuple[int, int]]) -> None:
     if args.iters < 1:
         raise ValueError("--iters must be >= 1.")
@@ -343,7 +395,27 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     config = make_config(args, family)
+    profile_dir = getattr(args, "profile_dir", None)
+    if profile_dir:
+        from vllm.config import ProfilerConfig
+
+        os.makedirs(profile_dir, exist_ok=True)
+        config.profiler_config = ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=profile_dir,
+            torch_profiler_record_shapes=True,
+            torch_profiler_with_flops=True,
+            torch_profiler_with_stack=False,
+            torch_profiler_use_gzip=True,
+        )
     engine = DiffusionEngine.make_engine(config)
+    if args.output_type == "latent":
+        # The pipeline's post_process_func always routes through the VAE image
+        # processor (it has no latent branch), so a raw latent tensor would
+        # crash diffusers' postprocess. Bypassing it lets the latent flow
+        # through normalize_diffusion_postprocess_output into .images, which
+        # dump_outputs saves as .pt.
+        engine.post_process_func = None
     try:
         for _ in range(args.warmup):
             await run_independent(engine, prompts[:1], sizes[:1], args, family)
@@ -360,6 +432,35 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         independent_mean = sum(independent_times) / len(independent_times)
         mixfusion_mean = sum(mixfusion_times) / len(mixfusion_times)
+        if args.dump_outputs_dir:
+            dump_dir = Path(args.dump_outputs_dir)
+            dump_outputs(dump_dir, "independent", independent_outputs)
+            dump_outputs(dump_dir, "mixfusion_batch", mixfusion_outputs)
+
+        profile_result: dict[str, Any] | None = None
+        if profile_dir:
+            # One dedicated profiled pass per mode; the torch profiler records
+            # per-op CPU/CUDA activity of the whole inference and gzips a chrome
+            # trace per diffusion worker into --profile-dir.
+            profiled_passes = []
+            for mode_name, runner in (
+                ("independent", run_independent),
+                ("mixfusion_batch", run_mixfusion_batch),
+            ):
+                prefix = f"{args.trace_prefix or 'profile'}-{mode_name}"
+                print(f"[profile] start {mode_name} (prefix={prefix})", flush=True)
+                engine.profile(is_start=True, profile_prefix=prefix)
+                try:
+                    elapsed, _ = await runner(engine, prompts, sizes, args, family)
+                finally:
+                    engine.profile(is_start=False)
+                profiled_passes.append({"mode": mode_name, "trace_prefix": prefix, "elapsed_s": elapsed})
+            traces = _wait_for_traces(profile_dir)
+            profile_result = {
+                "dir": profile_dir,
+                "passes": profiled_passes,
+                "traces": traces,
+            }
         return {
             "skipped": False,
             "family": args.family,
@@ -383,6 +484,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "independent": summarize_outputs(independent_outputs),
                 "mixfusion_batch": summarize_outputs(mixfusion_outputs),
             },
+            "profile": profile_result,
             "notes": [
                 "independent runs each prompt as its own request, one after another, with seed+i.",
                 "mixfusion_batch runs all prompts concurrently, so the DiT stage sees one mixed batch.",
@@ -409,8 +511,8 @@ def _qwen_config_fields(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _qwen_validate(args: argparse.Namespace, sizes: list[tuple[int, int]]) -> None:
-    if len(sizes) < 2:
-        raise ValueError("--image-sizes must contain at least two entries.")
+    if not sizes:
+        raise ValueError("--image-sizes must contain at least one entry.")
     if args.max_num_seqs < len(sizes):
         raise ValueError("--max-num-seqs must be >= the number of requested image sizes.")
 
@@ -456,10 +558,9 @@ class Family:
     defaults: dict[str, Any]
     # Where a request's resolution lives: the sampling params, or the prompt dict.
     resolution_in_prompt: bool
-    # Whether the one-request-at-a-time baseline also runs the MixFusion path.
-    # Qwen-Image keeps it on, so the speedup isolates the batching gain; the
-    # HunyuanImage-3.0 single-request path does not use it.
-    independent_mixfusion: bool
+    # The one-request-at-a-time baseline follows --enable-mixfusion (default
+    # off), so an independent run measures the same request path the batch
+    # run uses.
     extra_args: Callable[[argparse.Namespace, bool], dict[str, Any]]
     sampling_fields: dict[str, Any]
     config_fields: Callable[[argparse.Namespace], dict[str, Any]]
@@ -483,7 +584,6 @@ FAMILIES: dict[str, Family] = {
             "enable_expert_parallel": False,
         },
         resolution_in_prompt=False,
-        independent_mixfusion=True,
         extra_args=_qwen_extra_args,
         sampling_fields={"true_cfg_scale": 1.0, "max_sequence_length": 1024},
         config_fields=_qwen_config_fields,
@@ -508,7 +608,6 @@ FAMILIES: dict[str, Family] = {
             "enable_expert_parallel": True,
         },
         resolution_in_prompt=True,
-        independent_mixfusion=False,
         extra_args=_hunyuan_extra_args,
         sampling_fields={},
         config_fields=_hunyuan_config_fields,
@@ -549,10 +648,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enable-mixfusion",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable MixFusion for the batched path. Disable it for a batching-only control run.",
+        default=False,
+        help="Enable MixFusion (extra_args flag) for the requests. Off by default;"
+        " pass --enable-mixfusion to run the MixFusion path.",
     )
     parser.add_argument("--json-output", help="Also write the result JSON to this path.")
+    parser.add_argument(
+        "--dump-outputs-dir",
+        help="Save the final iteration's images (png) or latents (pt, with --output-type latent) here.",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        help="Dump torch-profiler chrome traces (per-op kernels, shapes, FLOPs) here; enables profiling.",
+    )
+    parser.add_argument("--trace-prefix", default="profile", help="Trace filename prefix used with --profile-dir.")
     # Qwen-Image only.
     parser.add_argument("--vae-scale-factor", type=int, default=8)
     parser.add_argument("--mixfusion-min-chunk-tokens", type=int, default=256)
@@ -584,6 +693,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    # bench-A (main) creates wake_events with the default mp context before
+    # _launch_workers flips the start method to spawn, which crashes with
+    # "SemLock created in a fork context ... shared with a process in a spawn
+    # context". Make spawn the default up front so both sides are consistent.
+    import multiprocessing as _mp
+
+    _mp.set_start_method("spawn", force=True)
     result = asyncio.run(benchmark(args))
     text = json.dumps(result, indent=2, ensure_ascii=False)
     print(text)

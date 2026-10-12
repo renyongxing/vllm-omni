@@ -193,7 +193,7 @@ chunk size is their GCD, so `1024x1024` + `1024x768` (4096 + 3072 tokens, GCD
 1024) batch well, while `1024x1024` + `640x640` (4096 + 1600, GCD 64) fall below
 the 256-token minimum and run independently instead.
 
-Three entry points cover different levels of the stack.
+Four entry points cover different levels of the stack.
 
 ### Synthetic DiT-like stack
 
@@ -238,6 +238,53 @@ python benchmarks/diffusion/mixfusion_benefit.py \
 
 Pass `--no-enable-mixfusion` for a batching-only control run, and
 `--json-output <path>` to also write the result JSON to disk.
+
+`--output-type latent --dump-outputs-dir <dir>` saves the final latents as one
+`.pt` per request (used by the parity tooling below).
+
+### Full-matrix A/B endorsement harness
+
+For PR-scale A/B endorsements (e.g. main vs a MixFusion PR head), a set of
+scripts drives `mixfusion_benefit.py` over two repo checkouts and aggregates
+the evidence:
+
+| script | role |
+| --- | --- |
+| `mixfusion_ab_bench.sh` | per-case driver: the 9-case timing matrix (A/B x W1/W2/W3 x mixfusion off/on) into `$RESULTS` |
+| `mixfusion_ab_matrix.sh` | thin wrapper fixing `RESULTS=results_v3` |
+| `mixfusion_ab_parity.sh` | latent dump matrix (both sides, `--output-type latent`, one `.pt` per request) into `$PARITY`, incl. A-vs-A noise-floor controls |
+| `mixfusion_ab_summarize.py` | aggregates `$RESULTS` + `$PARITY` into a markdown report: timing, flat-varlen evidence, latent parity with an explicit noise-band tolerance, and an image-level PSNR/SSIM layer |
+| `mixfusion_ab_image_parity.py` | decodes dumped latents through the same VAE and compares images pairwise (PSNR/SSIM/max pixel diff) |
+| `mixfusion_ab_latent_diff.py` | quick pairwise diff of two dump dirs |
+
+Workloads: W1 = single 1024x1024 request, W2 = 8x 1024x1024, W3 = 8 mixed
+(1024x1024 x2, 1024x768 x2, 768x1024 x2, 512x512 x2).
+
+Both sides run the *same* driver code: `VLLM_OMNI_ROOT` + `PYTHONPATH` point
+the engine at the intended checkout (`A_WT` baseline, `B_WT` candidate), so the
+comparison isolates the candidate's changes. The candidate should sit on top
+of the measured baseline commit. If one side auto-compiles graphs while the
+other does not, keep eager on both (the default, `EAGER=0` to disable).
+
+```bash
+export A_WT=/path/to/baseline B_WT=/path/to/candidate
+export RESULTS=$PWD/results_v3 PARITY=$PWD/parity_v3
+bash benchmarks/diffusion/mixfusion_ab_matrix.sh   # 9 timing cases, resumable
+bash benchmarks/diffusion/mixfusion_ab_parity.sh   # 13 dump cases, resumable
+python benchmarks/diffusion/mixfusion_ab_summarize.py \
+  --a-worktree "$A_WT" --b-worktree "$B_WT" --report report.md
+```
+
+Each timing case is a fresh engine process; `result.json` files and `done`
+markers make the runs resumable, `PILOT=1` switches to a steps=8 smoke run,
+and `ONLY=<case>` re-runs a single case (`FORCE=1` to overwrite). The report's
+acceptance bar: no B-off regression on any workload, W1 bit-identical to A,
+and every A-vs-B-on image pair >= 40 dB PSNR / >= 0.98 SSIM after the
+same-VAE decode.
+
+Large batches need a normal-sized `/dev/shm` (the dump path copies result
+tensors through shared memory); raise the container limit or the 8-request
+cases can fail in the engine's output transfer.
 
 ### Online serving
 
