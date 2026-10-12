@@ -170,7 +170,6 @@ def build_mixfusion_plan(
     chunk_to_request: torch.Tensor,
     device: torch.device,
 ) -> MixFusionPlan:
-    num_requests = len(request_chunk_ranges)
     cu_seqlens = [0]
     txt_out_rows: list[int] = []
     img_out_rows: list[int] = []
@@ -185,7 +184,7 @@ def build_mixfusion_plan(
         cu_seqlens.append(base + txt_len + img_len)
         max_seq_len = max(max_seq_len, txt_len + img_len)
         txt_pad_rows.extend(range(req_idx * seq_len_txt, req_idx * seq_len_txt + txt_len))
-    needs_padding = any(int(l) < seq_len_txt for l in real_txt_lens)
+    needs_padding = any(txt_len < seq_len_txt for txt_len in real_txt_lens)
     return MixFusionPlan(
         cu_seqlens=cu_seqlens,
         cu_seqlens_tensor=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
@@ -927,11 +926,23 @@ class QwenImageCrossAttention(nn.Module):
         # [num_requests, seq_len_txt, D/2] request order, so no flat cos/sin
         # packing is needed.
         img_query, img_key = _qwen_image_qk_norm_rope(
-            img_query, img_key, self.norm_q, self.norm_k, image_freq_chunks, self.rope, self.eps,
+            img_query,
+            img_key,
+            self.norm_q,
+            self.norm_k,
+            image_freq_chunks,
+            self.rope,
+            self.eps,
             use_fused=self.qk_norm,
         )
         txt_query, txt_key = _qwen_image_qk_norm_rope(
-            txt_query, txt_key, self.norm_added_q, self.norm_added_k, text_freqs, self.rope, self.eps,
+            txt_query,
+            txt_key,
+            self.norm_added_q,
+            self.norm_added_k,
+            text_freqs,
+            self.rope,
+            self.eps,
         )
 
         flat_queries: list[torch.Tensor] = []
@@ -970,9 +981,7 @@ class QwenImageCrossAttention(nn.Module):
             txt_rows = joint_hidden_states.index_select(0, plan.txt_out_idx)
             img_rows = joint_hidden_states.index_select(0, plan.img_out_idx)
             if plan.txt_pad_idx is None:
-                txt_attn_output = txt_rows.view(
-                    num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim
-                )
+                txt_attn_output = txt_rows.view(num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim)
             else:
                 txt_buffer = txt_rows.new_zeros(
                     num_requests * plan.seq_len_txt, self.add_query_num_heads, self.head_dim
@@ -981,9 +990,7 @@ class QwenImageCrossAttention(nn.Module):
                 txt_attn_output = txt_buffer.view(
                     num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim
                 )
-            img_attn_output = img_rows.view(
-                image_chunks.shape[0], plan.chunk_size, self.query_num_heads, self.head_dim
-            )
+            img_attn_output = img_rows.view(image_chunks.shape[0], plan.chunk_size, self.query_num_heads, self.head_dim)
         else:
             # The selected backend cannot handle flat varlen inputs. Fall back
             # to per-request dense attention: run each request independently
