@@ -3,10 +3,13 @@
 """Tests for the MixFusion block-forward-hook guard (CPU).
 
 ``_forward_mixfusion`` invokes ``block.forward_mixfusion`` directly, which
-bypasses the HookRegistry wrapper around ``block.forward``; under layerwise
-offload only the first block is materialized, so the packed path must refuse
-to run while blocks carry hooks, and the pipeline must fall back to the serial
-path, whose per-request loops route every block through the hooked module call.
+bypasses the HookRegistry wrapper around ``block.forward`` and any
+PyTorch-native forward hooks on the block; under layerwise offload only the
+first block is materialized, and under HSDP ``fully_shard`` registers native
+forward pre-hooks to all-gather sharded weights, so the packed path must
+refuse to run while blocks carry hooks, and the pipeline must fall back to
+the serial path, whose per-request loops route every block through the hooked
+module call.
 """
 
 from __future__ import annotations
@@ -35,6 +38,14 @@ def _hooked_block() -> nn.Module:
     """A block with a registered hook, as installed by layerwise offload."""
     block = _PlainBlock()
     HookRegistry.get_or_create(block).register_hook("layerwise_offload", ModelHook())
+    return block
+
+
+def _hsdp_like_block() -> nn.Module:
+    """A block with a PyTorch-native forward pre-hook, as registered by
+    HSDP's ``fully_shard`` (the unshard/all-gather pre-hook)."""
+    block = _PlainBlock()
+    block.register_forward_pre_hook(lambda module, args: args)
     return block
 
 
@@ -89,8 +100,30 @@ def test_has_active_block_hooks_reflects_block_hooks():
     assert _transformer([_PlainBlock(), _hooked_block()]).has_active_block_hooks()
 
 
+def test_has_active_block_hooks_reflects_native_block_hooks():
+    # HSDP's fully_shard registers PyTorch-native hooks (invisible to the
+    # Omni HookRegistry); the guard must fall back for those too.
+    assert not _transformer([_PlainBlock()]).has_active_block_hooks()
+    assert _transformer([_PlainBlock(), _hsdp_like_block()]).has_active_block_hooks()
+
+
 def test_forward_mixfusion_rejects_hooked_blocks():
     transformer = _transformer([_hooked_block()])
+
+    with pytest.raises(ValueError, match="bypasses block forward hooks"):
+        transformer._forward_mixfusion(
+            hidden_states=[torch.zeros(1, 8, 16)],
+            encoder_hidden_states=torch.zeros(1, 4, 8),
+            encoder_hidden_states_mask=None,
+            timestep=torch.zeros(1),
+            img_shapes=[(16, 2, 2)],
+            txt_seq_lens=[4],
+            guidance=None,
+        )
+
+
+def test_forward_mixfusion_rejects_native_hooked_blocks():
+    transformer = _transformer([_hsdp_like_block()])
 
     with pytest.raises(ValueError, match="bypasses block forward hooks"):
         transformer._forward_mixfusion(

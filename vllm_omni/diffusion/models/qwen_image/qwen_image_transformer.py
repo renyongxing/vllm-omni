@@ -1465,14 +1465,23 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         ``_forward_mixfusion`` invokes ``block.forward_mixfusion`` directly,
         which bypasses the HookRegistry wrapper installed around
-        ``block.forward``; hooks such as layerwise offload (block-weight
-        prefetch) would therefore never fire and offloaded blocks would run
-        with empty weight storage. Callers must fall back to the standard
-        forward path when this returns True.
+        ``block.forward`` and any PyTorch-native forward hooks on the block.
+        Omni hooks such as layerwise offload (block-weight prefetch) would
+        therefore never fire and offloaded blocks would run with empty weight
+        storage; HSDP's ``fully_shard`` registers native forward pre-hooks to
+        all-gather sharded weights, so hooked blocks would run on sharded
+        weights. Callers must fall back to the standard forward path when this
+        returns True.
         """
         for attr in self._layerwise_offload_blocks_attrs:
             for block in getattr(self, attr, []):
                 if module_has_active_hooks(block):
+                    return True
+                # PyTorch-native hooks (e.g. FSDP2 fully_shard's unshard
+                # pre-hook) live in the module's own hook dicts, not the
+                # Omni registry, and are equally bypassed by the direct
+                # forward_mixfusion call.
+                if getattr(block, "_forward_pre_hooks", None) or getattr(block, "_forward_hooks", None):
                     return True
         return False
 
@@ -1494,7 +1503,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
         if self.has_active_block_hooks():
             raise ValueError(
                 "Qwen MixFusion packed forward bypasses block forward hooks "
-                "(e.g. layerwise offload); fall back to the standard forward path."
+                "(e.g. layerwise offload or HSDP fully_shard); fall back to "
+                "the standard forward path."
             )
         if not hidden_states:
             raise ValueError("Qwen MixFusion requires at least one hidden-state tensor.")
