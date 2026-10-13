@@ -828,10 +828,16 @@ class QwenImagePipeline(
         # QwenImage always normalizes CFG output (matching forward())
         state.sampling.cfg_normalize = True
         extra_args = getattr(state.sampling, "extra_args", {}) or {}
-        if bool(extra_args.get("enable_mixfusion", False)):
+        # Server-level default from od_config; an explicit request value
+        # (True or False) overrides it.
+        if bool(extra_args.get("enable_mixfusion", self.od_config.enable_mixfusion)):
             state.extra["use_ragged_latents"] = True
-            state.extra["mixfusion_min_chunk_tokens"] = extra_args.get("mixfusion_min_chunk_tokens", 256)
-            state.extra["mixfusion_max_chunks"] = extra_args.get("mixfusion_max_chunks", 128)
+            state.extra["mixfusion_min_chunk_tokens"] = extra_args.get(
+                "mixfusion_min_chunk_tokens", self.od_config.mixfusion_min_chunk_tokens
+            )
+            state.extra["mixfusion_max_chunks"] = extra_args.get(
+                "mixfusion_max_chunks", self.od_config.mixfusion_max_chunks
+            )
 
         return state
 

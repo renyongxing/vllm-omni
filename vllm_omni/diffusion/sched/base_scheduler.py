@@ -58,10 +58,11 @@ def _apply_mixfusion_shape_relaxation(
     values: dict,
     *,
     relax_shapes: bool = True,
+    server_default: bool = False,
 ) -> dict | None:
     sampling = request.sampling_params
     extra_args = getattr(sampling, "extra_args", {}) or {}
-    if not bool(extra_args.get("enable_mixfusion", False)):
+    if not bool(extra_args.get("enable_mixfusion", server_default)):
         return values
 
     if any(isinstance(prompt, dict) and prompt.get("additional_information") for prompt in request.prompts):
@@ -757,7 +758,11 @@ class BaseScheduler(ABC):
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
         key_kwargs = {name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-        key_kwargs = _apply_mixfusion_shape_relaxation(request, key_kwargs)
+        key_kwargs = _apply_mixfusion_shape_relaxation(
+            request,
+            key_kwargs,
+            server_default=bool(getattr(self.od_config, "enable_mixfusion", False)),
+        )
         if key_kwargs is None:
             return None
         return StepBatchSamplingParamsKey(
