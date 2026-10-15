@@ -1077,7 +1077,7 @@ class QwenImagePipeline(
         self,
         input_batch: "InputBatch",
         **kwargs: Any,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | list[torch.Tensor] | None:
         """One denoise step: read from *input_batch*, delegate to CFGParallelMixin.
 
         Reuses ``predict_noise_maybe_with_cfg`` so that CFG-parallel,
