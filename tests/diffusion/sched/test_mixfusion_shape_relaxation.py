@@ -9,7 +9,7 @@ pipeline the request-level flag degrades to a no-op and resolution keeps groupin
 the batch (a server-level flag is rejected at engine startup instead).
 Request-mode batches still resolve one height/width for the whole batch from the
 first request's sampling params, so they keep resolution in their key.
-Requests that carry per-prompt ``additional_information`` cannot share a key at all,
+A prompt dict that carries ``additional_information`` cannot share a key at all,
 which both schedulers express by returning ``None``.
 """
 
@@ -47,14 +47,14 @@ class _Scheduler(BaseScheduler):
         return set()
 
 
-def _request(prompts: list[Any], **sampling_overrides: Any) -> SimpleNamespace:
+def _request(prompt: Any, **sampling_overrides: Any) -> SimpleNamespace:
     sampling: dict[str, Any] = {field.name: field.default for field in fields(StepBatchSamplingParamsKey)}
     sampling.update({field.name: field.default for field in fields(RequestBatchSamplingParamsKey)})
     sampling.update(SHAPE, extra_args={}, lora_request=None)
     sampling.update(sampling_overrides)
     return SimpleNamespace(
         sampling_params=SimpleNamespace(**sampling),
-        prompts=prompts,
+        prompt=prompt,
         batch_compatibility_key=None,
         use_step_execution=True,
     )
@@ -74,7 +74,7 @@ def _initialized_scheduler(scheduler_cls, monkeypatch: pytest.MonkeyPatch, pipel
 
 @pytest.mark.parametrize("scheduler_cls", [_Scheduler, RequestScheduler])
 def test_shape_still_splits_the_key_without_mixfusion(scheduler_cls):
-    request = _request(["a cat"])
+    request = _request("a cat")
     values = dict(SHAPE)
 
     assert _apply_mixfusion_shape_relaxation(request, values) is values
@@ -83,7 +83,7 @@ def test_shape_still_splits_the_key_without_mixfusion(scheduler_cls):
 
 
 def test_mixfusion_drops_shape_from_the_step_key(monkeypatch: pytest.MonkeyPatch):
-    request = _request(["a cat"], extra_args={"enable_mixfusion": True})
+    request = _request("a cat", extra_args={"enable_mixfusion": True})
     values = dict(SHAPE)
 
     assert _apply_mixfusion_shape_relaxation(request, values) is values
@@ -99,7 +99,7 @@ def test_mixfusion_keeps_shape_in_the_request_mode_key(monkeypatch: pytest.Monke
     # The request-mode batch forward resolves one height/width for the whole
     # batch from the first request's sampling params, so resolution must keep
     # splitting the key until that path supports mixed shapes.
-    request = _request(["a cat"], extra_args={"enable_mixfusion": True})
+    request = _request("a cat", extra_args={"enable_mixfusion": True})
 
     scheduler = _initialized_scheduler(RequestScheduler, monkeypatch, _MixfusionCapablePipeline)
     key = scheduler._build_sampling_params_key(request)
@@ -109,7 +109,7 @@ def test_mixfusion_keeps_shape_in_the_request_mode_key(monkeypatch: pytest.Monke
 @pytest.mark.parametrize("scheduler_cls", [_Scheduler, RequestScheduler])
 def test_mixfusion_leaves_per_prompt_requests_without_a_key(scheduler_cls, monkeypatch: pytest.MonkeyPatch):
     request = _request(
-        [{"prompt": "a cat", "additional_information": {"image": "x"}}],
+        {"prompt": "a cat", "additional_information": {"image": "x"}},
         extra_args={"enable_mixfusion": True},
     )
 
@@ -119,7 +119,7 @@ def test_mixfusion_leaves_per_prompt_requests_without_a_key(scheduler_cls, monke
 
 
 def test_requests_without_mixfusion_keep_their_key_despite_additional_information():
-    request = _request([{"prompt": "a cat", "additional_information": {"image": "x"}}])
+    request = _request({"prompt": "a cat", "additional_information": {"image": "x"}})
 
     assert _Scheduler()._build_sampling_params_key(request) is not None
 
@@ -168,13 +168,13 @@ def test_request_level_mixfusion_degrades_on_unsupported_pipeline(scheduler_cls,
     # never co-batch, exactly as if MixFusion were off.
     scheduler = _initialized_scheduler(scheduler_cls, monkeypatch, _PlainPipeline)
 
-    request = _request(["a cat"], extra_args={"enable_mixfusion": True})
+    request = _request("a cat", extra_args={"enable_mixfusion": True})
     key = scheduler._build_sampling_params_key(request)
     assert (key.height, key.width, key.resolution) == (1024, 768, 1024)
 
     # Per-prompt requests keep their key too instead of becoming unbatchable.
     per_prompt = _request(
-        [{"prompt": "a cat", "additional_information": {"image": "x"}}],
+        {"prompt": "a cat", "additional_information": {"image": "x"}},
         extra_args={"enable_mixfusion": True},
     )
     assert scheduler._build_sampling_params_key(per_prompt) is not None

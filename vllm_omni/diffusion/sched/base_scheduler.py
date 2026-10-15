@@ -71,7 +71,8 @@ def _apply_mixfusion_shape_relaxation(
     if not mixfusion_supported or not bool(extra_args.get("enable_mixfusion", server_default)):
         return values
 
-    if any(isinstance(prompt, dict) and prompt.get("additional_information") for prompt in request.prompts):
+    prompt = request.prompt
+    if isinstance(prompt, dict) and prompt.get("additional_information"):
         return None
 
     if not relax_shapes:
