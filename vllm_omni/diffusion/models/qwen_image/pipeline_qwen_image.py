@@ -278,6 +278,10 @@ class QwenImagePipeline(
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
     supports_step_execution: ClassVar[bool] = True
+    # Opt-in: this pipeline packs mixed-resolution requests into one denoise
+    # step via ragged latents, so the scheduler may relax height/width out of
+    # the batch key when MixFusion is enabled.
+    supports_mixfusion: ClassVar[bool] = True
 
     def __init__(
         self,

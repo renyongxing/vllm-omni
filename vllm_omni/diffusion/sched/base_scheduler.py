@@ -26,6 +26,7 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
 )
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.registry import supports_mixfusion
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -59,10 +60,15 @@ def _apply_mixfusion_shape_relaxation(
     *,
     relax_shapes: bool = True,
     server_default: bool = False,
+    mixfusion_supported: bool = True,
 ) -> dict | None:
     sampling = request.sampling_params
     extra_args = getattr(sampling, "extra_args", {}) or {}
-    if not bool(extra_args.get("enable_mixfusion", server_default)):
+    # A request-level enable_mixfusion flag on a pipeline without the
+    # capability degrades to a no-op: resolution stays in the batch key, so
+    # requests simply group by shape as if MixFusion were off. (Server-level
+    # enable_mixfusion on such a pipeline is rejected at engine startup.)
+    if not mixfusion_supported or not bool(extra_args.get("enable_mixfusion", server_default)):
         return values
 
     if any(isinstance(prompt, dict) and prompt.get("additional_information") for prompt in request.prompts):
@@ -87,6 +93,10 @@ class BaseScheduler(ABC):
 
     def __init__(self) -> None:
         self.od_config: OmniDiffusionConfig | None = None
+        # Fail-safe default until initialize() resolves the pipeline class:
+        # without the MixFusion capability, resolution must keep splitting the
+        # batch key.
+        self._mixfusion_supported: bool = False
         self._request_states: dict[str, SchedulerRequestState] = {}
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
@@ -116,6 +126,7 @@ class BaseScheduler(ABC):
         kv_vllm_config: VllmConfig | None = None,
     ) -> None:
         self.od_config = od_config
+        self._mixfusion_supported = supports_mixfusion(od_config)
         self._native_prefetch_enabled = native_prefetch_enabled(od_config)
         self._native_prefetch_request_id = None
         self._request_states.clear()
@@ -762,6 +773,7 @@ class BaseScheduler(ABC):
             request,
             key_kwargs,
             server_default=bool(getattr(self.od_config, "enable_mixfusion", False)),
+            mixfusion_supported=self._mixfusion_supported,
         )
         if key_kwargs is None:
             return None

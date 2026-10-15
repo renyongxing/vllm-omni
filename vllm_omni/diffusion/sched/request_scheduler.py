@@ -116,7 +116,12 @@ class RequestScheduler(BaseScheduler):
         # the first request's sampling params, so mixed-resolution requests
         # must not share a batch; keep resolution in the key (see
         # QwenImagePipeline.forward).
-        values = _apply_mixfusion_shape_relaxation(request, values, relax_shapes=False)
+        values = _apply_mixfusion_shape_relaxation(
+            request,
+            values,
+            relax_shapes=False,
+            mixfusion_supported=self._mixfusion_supported,
+        )
         if values is None:
             return None
         return RequestBatchSamplingParamsKey(**values)
