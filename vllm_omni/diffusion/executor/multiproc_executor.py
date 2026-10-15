@@ -172,6 +172,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._closed = False
         self._is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
+        # The executor pins a spawn context instead of relying on the global
+        # start method: wake_events below are created here, in _init_executor,
+        # while _launch_workers only switches the global start method to spawn
+        # later. mp.Event() would therefore come from the default (fork)
+        # context and then be pickled into spawn-Process args, which is
+        # unsupported — sync primitives must come from the same context as the
+        # processes that consume them.
         self._mp_context = mp.get_context("spawn")
         self._result_mq: MessageQueue | None = None
         self._result_mqs: list[MessageQueue] = []
