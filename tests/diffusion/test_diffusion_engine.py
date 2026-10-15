@@ -622,9 +622,7 @@ class TestMixFusionCapability:
         with pytest.raises(ValueError, match="does not support MixFusion"):
             engine._resolve_execution_mode(od_config)
 
-    def test_engine_accepts_server_level_mixfusion_on_supported_pipeline(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_engine_accepts_server_level_mixfusion_on_supported_pipeline(self, monkeypatch: pytest.MonkeyPatch) -> None:
         od_config = SimpleNamespace(
             model_class_name="MixfusionPipeline",
             custom_pipeline_args=None,
