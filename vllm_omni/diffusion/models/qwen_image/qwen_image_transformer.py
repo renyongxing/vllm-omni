@@ -7,7 +7,6 @@ import math
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from functools import lru_cache
 from math import prod
 from typing import TYPE_CHECKING, Any
 
