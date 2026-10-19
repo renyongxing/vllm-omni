@@ -283,6 +283,8 @@ class QwenImagePipeline(
     # the batch key when MixFusion is enabled.
     supports_mixfusion: ClassVar[bool] = True
 
+    supports_weight_reload: ClassVar[bool] = True
+
     def __init__(
         self,
         *,
@@ -1097,7 +1099,6 @@ class QwenImagePipeline(
 
         t = input_batch.timesteps
         self._current_timestep = t
-        self.transformer.do_true_cfg = input_batch.do_true_cfg
 
         if isinstance(input_batch.latents, list):
             return self._denoise_step_mixfusion(input_batch)
