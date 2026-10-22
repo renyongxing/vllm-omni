@@ -180,23 +180,30 @@ class FlashAttentionBackend(AttentionBackend):
         # CUDA: forward_cuda dispatches the packed cu_seqlens varlen path
         # before ever reading attn_mask. NPU: forward_fa_npu honors the
         # npu_attn_varlen opt-in and rebuilds the padding mask itself if the
-        # packed contract fails. XPU reads attn_mask, so models must keep
-        # constructing it there.
+        # packed contract fails. XPU: forward_xpu only takes the packed path
+        # when attn_mask is None, so models must keep constructing it there.
         return current_omni_platform.is_cuda() or current_omni_platform.is_npu()
 
     @classmethod
     def supports_multi_doc_packed_varlen(cls) -> bool:
-        # CUDA / ROCm / MUSA all route through ``forward_cuda``, which
-        # dispatches ``_forward_varlen_packed`` -> ``flash_attn_varlen_func``
-        # over the caller's cu_seqlens without a mask, so an arbitrary
-        # N-document packing keeps its boundaries. NPU's forward path
-        # (``_resolve_packed_seq_npu``) only accepts a ``[real, pad]``
-        # two-document layout (cu_seqlens shape <= 3) and otherwise falls
-        # back to a padding-mask rebuild that spans the whole packed row,
-        # so N>=2 real documents would silently attend across request
-        # boundaries. XPU never consumes cu_seqlens from ``extra``. Both
-        # therefore stay False here.
-        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
+        # CUDA / ROCm / MUSA / XPU all dispatch ``_forward_varlen_packed`` ->
+        # ``flash_attn_varlen_func`` over the caller's cu_seqlens without a
+        # mask, so an arbitrary N-document packing keeps its boundaries.
+        # NPU's forward path (``_resolve_packed_seq_npu``) only accepts a
+        # ``[real, pad]`` two-document layout (cu_seqlens shape <= 3) and
+        # otherwise falls back to a padding-mask rebuild that spans the whole
+        # packed row, so N>=2 real documents would silently attend across
+        # request boundaries; NPU stays False here.
+        if current_omni_platform.is_npu():
+            return False
+        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+
+        return flash_attn_varlen_func is not None and (
+            current_omni_platform.is_cuda()
+            or current_omni_platform.is_rocm()
+            or current_omni_platform.is_musa()
+            or current_omni_platform.is_xpu()
+        )
 
     @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
@@ -505,6 +512,11 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         Some diffusion transformers already maintain exact packed-document
         boundaries. Reusing those boundaries avoids rebuilding boolean masks
         and gathering/scattering Q/K/V in every attention layer.
+
+        Accepts either a flat packed ``[total_tokens, heads, head_dim]`` layout
+        (dynamic multi-document batching) or a single packed row
+        ``[1, total_tokens, heads, head_dim]``; both return the same layout as
+        their input.
         """
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
@@ -512,13 +524,29 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         if flash_attn_varlen_func is None:
             raise ImportError("Packed variable-length attention requires flash_attn_varlen_func")
-        if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
-            raise ValueError("Packed variable-length attention currently requires batch size 1")
+        if query.ndim == 3 and key.ndim == 3 and value.ndim == 3:
+            q_flat, k_flat, v_flat = query, key, value
+            out_shape = None
+        elif (
+            query.ndim == 4
+            and key.ndim == 4
+            and value.ndim == 4
+            and query.shape[0] == 1
+            and key.shape[0] == 1
+            and value.shape[0] == 1
+        ):
+            q_flat, k_flat, v_flat = query.flatten(0, 1), key.flatten(0, 1), value.flatten(0, 1)
+            out_shape = query.shape
+        else:
+            raise ValueError(
+                "Packed variable-length attention expects flat [total_tokens, heads, head_dim] "
+                "or [1, total_tokens, heads, head_dim] Q/K/V."
+            )
 
         out = flash_attn_varlen_func(
-            q=query.flatten(0, 1),
-            k=key.flatten(0, 1),
-            v=value.flatten(0, 1),
+            q=q_flat,
+            k=k_flat,
+            v=v_flat,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
@@ -527,7 +555,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             softmax_scale=self.softmax_scale,
         )
         out = self._unwrap_flash_output(out)
-        return out.reshape_as(query)
+        if out_shape is not None:
+            out = out.reshape(out_shape)
+        return out
 
     def _forward_varlen_dense(
         self,
@@ -675,44 +705,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
         return paged_kv_context.restore_output(output)
 
-    def _forward_varlen_flat(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
-        """Run padding-free FlashAttention over flat packed dynamic Q/K/V."""
-        from vllm_omni.diffusion.attention.backends.utils.fa import (
-            flash_attn_varlen_func,
-        )
-
-        if flash_attn_varlen_func is None:
-            raise ImportError("Flat variable-length attention requires flash_attn_varlen_func")
-        if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
-            raise ValueError("Flat varlen FlashAttention expects [total_tokens, heads, head_dim] Q/K/V.")
-        if attn_metadata.attn_mask is not None or attn_metadata.joint_attn_mask is not None:
-            raise ValueError("Flat varlen FlashAttention does not accept attention masks.")
-        if attn_metadata.padded_tokens != 0:
-            raise ValueError("Flat varlen FlashAttention requires padded_tokens=0.")
-        if attn_metadata.q_cu_seqlens is None or attn_metadata.kv_cu_seqlens is None:
-            raise ValueError("Flat varlen FlashAttention requires q_cu_seqlens and kv_cu_seqlens.")
-        if attn_metadata.max_q_len is None or attn_metadata.max_kv_len is None:
-            raise ValueError("Flat varlen FlashAttention requires max_q_len and max_kv_len.")
-
-        out = flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            cu_seqlens_q=attn_metadata.q_cu_seqlens,
-            cu_seqlens_k=attn_metadata.kv_cu_seqlens,
-            max_seqlen_q=attn_metadata.max_q_len,
-            max_seqlen_k=attn_metadata.max_kv_len,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
-        )
-        return self._unwrap_flash_output(out)
-
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -739,10 +731,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attention_mask = metadata_plan.attention_mask
         full_attn_spans = metadata_plan.full_attn_spans
         extra = metadata_plan.extra
-
-        if attn_metadata is not None and attn_metadata.is_varlen:
-            self._warn_fa_deterministic_non_dense("flat-varlen")
-            return self._forward_varlen_flat(query, key, value, attn_metadata)
 
         kv_quant_method = extra.get("kv_cache_dtype")
         if kv_quant_method not in (None, "float", "auto"):
@@ -781,6 +769,11 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
 
         if metadata_plan.packing_mode is not PackingMode.NONE:
+            if query.ndim == 3 and attention_mask is not None:
+                raise ValueError(
+                    "Flat packed varlen attention cannot apply an attention mask; "
+                    "pass the document boundaries via cu_seqlens instead."
+                )
             self._warn_fa_deterministic_non_dense("packed-varlen")
             return self._forward_varlen_packed(
                 query,
@@ -1021,11 +1014,24 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
 
-        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        metadata_plan = _normalize_flash_attention_metadata(attn_metadata)
+        attention_mask = metadata_plan.attention_mask
 
-        if attn_metadata is not None and attn_metadata.is_varlen:
-            self._warn_fa_deterministic_non_dense("flat-varlen")
-            return self._forward_varlen_flat(query, key, value, attn_metadata)
+        # Packed cu_seqlens dispatch mirrors forward_cuda. Only take it when
+        # no attn_mask rides along: callers that still build a padding mask
+        # (e.g. [real, pad] packed layouts on backends without
+        # supports_packed_mask_free) must keep the masked path below.
+        if metadata_plan.packing_mode is not PackingMode.NONE and attention_mask is None:
+            self._warn_fa_deterministic_non_dense("packed-varlen")
+            return self._forward_varlen_packed(
+                query,
+                key,
+                value,
+                cu_seqlens_q=metadata_plan.extra["cu_seqlens_q"],
+                cu_seqlens_k=metadata_plan.extra["cu_seqlens_k"],
+                max_seqlen_q=metadata_plan.extra["max_seqlen_q"],
+                max_seqlen_k=metadata_plan.extra["max_seqlen_k"],
+            )
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
