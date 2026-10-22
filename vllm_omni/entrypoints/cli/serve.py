@@ -888,7 +888,8 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help=(
                 "Enable mixed-resolution batch packing (MixFusion) in the diffusion scheduler "
-                "as the server-level default (default: disabled). "
+                "as the server-level default (default: disabled). MixFusion requires step "
+                "execution, which is enabled automatically when this flag is set. "
                 "--no-enable-mixfusion overrides a deploy YAML stage enabled with enable_mixfusion."
             ),
         )

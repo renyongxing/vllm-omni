@@ -181,6 +181,11 @@ Qwen-Image only). On any other pipeline, server-level `--enable-mixfusion`
 fails at startup; a request-level `extra_args={"enable_mixfusion": True}` is a
 safe no-op and requests keep batching by resolution.
 
+MixFusion only mixes resolutions in step execution. When server-level
+`--enable-mixfusion` is set, step execution is enabled automatically (a
+warning is logged if it was off), so the command above works without
+`--step-execution`. Request-level `extra_args` in request mode remain a no-op.
+
 Constraints on the packed path:
 
 - **Edit (image-conditioned) requests**: silently fall back to serial ragged

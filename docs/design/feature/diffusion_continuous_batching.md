@@ -204,7 +204,10 @@ cost of a pipeline contract the scheduler must not assume generically:
   (read via `getattr`, not part of the runtime protocol check). Currently
   only `QwenImagePipeline` sets it.
 - The engine resolves the capability through the registry at startup and
-  rejects server-level `enable_mixfusion` on pipelines without it.
+  rejects server-level `enable_mixfusion` on pipelines without it. Because
+  resolution only leaves the step-batch key under the `StepScheduler`,
+  server-level `enable_mixfusion` also enables step execution automatically
+  (same coupling as `streaming_output`).
 - The scheduler resolves the capability in `initialize()` and only then
   applies the shape relaxation. On an unsupported pipeline, a request-level
   `extra_args={"enable_mixfusion": True}` degrades to a no-op: resolution
