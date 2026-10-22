@@ -221,8 +221,10 @@ forward. Requests fall back to `_denoise_step_serial_ragged` when they carry
 image latents (edit path), raise `zero_cond_t`, run with SP>1, have active
 forward hooks, or run with `do_true_cfg`; per-request thresholds
 (`mixfusion_min_chunk_tokens`, `mixfusion_max_chunks`) are aggregated as
-max/min across the batch. On NPU the flat varlen attention backend is
-unavailable and packed batches run per-request dense attention.
+max/min across the batch. Backends without packed varlen support (e.g. NPU)
+are served by the attention layer's automatic fallback: documents are grouped
+by length into mask-free dense forwards, so the packed dispatch stays active
+and documents remain isolated without a per-request loop.
 
 Known limitation: the packed dispatch does not thread `attention_kwargs`
 into the packed forward; features that rely on it (e.g. LoRA scales,

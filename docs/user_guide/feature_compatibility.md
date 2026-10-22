@@ -194,8 +194,9 @@ Constraints on the packed path:
 - **Forward hooks (incl. HSDP `fully_shard`) and `do_true_cfg`**: the affected
   requests silently fall back to serial ragged execution; other requests in
   the batch are unaffected.
-- **NPU**: flat varlen attention is unavailable, so packed batches run
-  per-request dense attention (no cross-request packing benefit).
+- **NPU**: the packed varlen kernel is unavailable, so the attention layer
+  serves packed batches through its automatic length-bucketed dense fallback
+  (documents stay isolated; no varlen-kernel speedup, no per-request loop).
 
 ## Limitations
 

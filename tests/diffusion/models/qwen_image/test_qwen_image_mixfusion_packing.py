@@ -4,18 +4,23 @@
 
 The FlashAttention kernel needs an accelerator, so these tests drive the real
 ``forward_mixfusion`` packing logic with stub projections and a capturing
-attention stub: mixed-length requests (different text lengths and image chunk
-counts) must be flattened into one packed sequence with per-request
-``cu_seqlens``, in each request's ``text + image`` token order, with RoPE
-cos/sin cast to the activation dtype (the eager-path contract, #7494). Both
-the flat varlen branch and the per-request dense fallback are covered.
+``forward_packed`` stub: mixed-length requests (different text lengths and
+image chunk counts) must be flattened into one packed sequence with
+per-request ``cu_seqlens``, in each request's ``text + image`` token order,
+with RoPE cos/sin cast to the activation dtype (the eager-path contract,
+#7494). The model delegates to ``Attention.forward_packed`` once, so the
+backends that route to a varlen kernel and those served by the layer's
+bucketed dense fallback are covered through the same entry point.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageCrossAttention,
     build_mixfusion_plan,
@@ -57,7 +62,63 @@ class _CapturingRope:
         return tensor
 
 
-def _mixfusion_module(*, flat_varlen: bool, rope: _CapturingRope):
+def _segment_mean_flat(query, key, value, cu_seqlens):
+    """Per-document semantics: each document's rows gain its own K/V means.
+
+    A cross-document leak changes the means, so routing this through both the
+    varlen route and the bucketed dense fallback makes the two observable
+    parity checks of the packed layout, not just of shape plumbing.
+    """
+    out = torch.empty_like(query)
+    lengths = cu_seqlens.diff().tolist()
+    offset = 0
+    for length in lengths:
+        if length:
+            out[offset : offset + length] = (
+                query[offset : offset + length]
+                + key[offset : offset + length].mean(dim=0, keepdim=True)
+                + value[offset : offset + length].mean(dim=0, keepdim=True)
+            )
+        offset += length
+    return out
+
+
+class _PackedAttentionStub:
+    """Attention stand-in exposing the ``forward_packed`` entry point.
+
+    ``varlen`` applies the per-document semantics directly (the single-kernel
+    route); ``bucketed`` delegates to the production dense fallback so the
+    model's packing works unchanged on backends without packed varlen support.
+    """
+
+    def __init__(self, mode: str):
+        assert mode in ("varlen", "bucketed")
+        self.mode = mode
+        self.calls: list[dict] = []
+        self.dense_shapes: list[tuple] = []
+
+    def forward_packed(self, query, key, value, *, cu_seqlens, max_seqlen):
+        self.calls.append(
+            {
+                "query": query,
+                "key": key,
+                "value": value,
+                "cu_seqlens": cu_seqlens,
+                "max_seqlen": max_seqlen,
+            }
+        )
+        if self.mode == "varlen":
+            return _segment_mean_flat(query, key, value, cu_seqlens)
+
+        def dense_forward(dense_query, dense_key, dense_value, attn_metadata):
+            self.dense_shapes.append(tuple(dense_query.shape))
+            return dense_query + dense_key.mean(dim=1, keepdim=True) + dense_value.mean(dim=1, keepdim=True)
+
+        fake_layer = SimpleNamespace(forward=dense_forward)
+        return Attention._forward_packed_dense_buckets(fake_layer, query, key, value, cu_seqlens)
+
+
+def _mixfusion_module(*, attn: _PackedAttentionStub, rope: _CapturingRope):
     """A QwenImageCrossAttention with only forward_mixfusion's dependencies.
 
     Built via ``__new__`` so the vLLM parallel layers are never constructed:
@@ -65,12 +126,6 @@ def _mixfusion_module(*, flat_varlen: bool, rope: _CapturingRope):
     the packed token order directly assertable. Only non-Module attributes
     are set, so ``object.__setattr__`` bypasses the nn.Module machinery.
     """
-
-    attn_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, object]] = []
-
-    def fake_attn(query, key, value, attn_metadata):
-        attn_calls.append((query, key, value, attn_metadata))
-        return query
 
     module = QwenImageCrossAttention.__new__(QwenImageCrossAttention)
     attrs = {
@@ -90,12 +145,11 @@ def _mixfusion_module(*, flat_varlen: bool, rope: _CapturingRope):
         "qk_norm": True,
         "eps": 1e-6,
         "rope": rope,
-        "attn": fake_attn,
-        "_supports_flat_varlen_attention": lambda: flat_varlen,
+        "attn": attn,
     }
     for name, value in attrs.items():
         object.__setattr__(module, name, value)
-    return module, attn_calls
+    return module
 
 
 def _mixfusion_inputs():
@@ -130,7 +184,7 @@ def _forward(module):
 def _assert_rope_matches_eager_dtype_contract(rope: _CapturingRope):
     # The eager path (_qwen_image_qk_norm_rope) casts cos/sin to the activation
     # dtype; FP32 rotary numerics drop Omni-vs-Diffusers PSNR (#7494), so the
-    # mixfusion branches must not diverge from the default forward.
+    # mixfusion path must not diverge from the default forward.
     assert rope.calls, "RoPE was never applied"
     for call in rope.calls:
         assert call["tensor_dtype"] == torch.bfloat16
@@ -147,25 +201,23 @@ def _assert_output_shapes(img_out, txt_out):
     assert torch.all(txt_out[1, REAL_TXT_LENS[1] :] == 0)
 
 
-def test_forward_mixfusion_packs_mixed_requests_into_one_flat_sequence():
+def test_forward_mixfusion_packs_mixed_requests_into_one_packed_call():
+    attn = _PackedAttentionStub(mode="varlen")
     rope = _CapturingRope()
-    module, attn_calls = _mixfusion_module(flat_varlen=True, rope=rope)
+    module = _mixfusion_module(attn=attn, rope=rope)
 
     img_out, txt_out = _forward(module)
 
-    # One flat varlen call with per-request boundaries.
-    assert len(attn_calls) == 1
-    query, key, value, metadata = attn_calls[0]
+    # One forward_packed call with per-request boundaries.
+    assert len(attn.calls) == 1
+    call = attn.calls[0]
+    query, key, value = call["query"], call["key"], call["value"]
     total_tokens = sum(REQ_LENS)
     assert query.shape == (total_tokens, HEADS, HEAD_DIM)
     assert key.shape == (total_tokens, KV_HEADS, HEAD_DIM)
     assert value.shape == (total_tokens, KV_HEADS, HEAD_DIM)
-    assert metadata.is_varlen
-    assert torch.equal(metadata.q_cu_seqlens, torch.tensor(CU_SEQLENS, dtype=torch.int32))
-    assert torch.equal(metadata.kv_cu_seqlens, torch.tensor(CU_SEQLENS, dtype=torch.int32))
-    assert metadata.max_q_len == max(REQ_LENS)
-    assert metadata.max_kv_len == max(REQ_LENS)
-    assert metadata.padded_tokens == 0
+    assert torch.equal(call["cu_seqlens"], torch.tensor(CU_SEQLENS, dtype=torch.int32))
+    assert call["max_seqlen"] == max(REQ_LENS)
 
     # Each request's tokens are contiguous in "text, then image chunks" order.
     # Identity projections make the packed rows equal to the input rows.
@@ -188,25 +240,42 @@ def test_forward_mixfusion_packs_mixed_requests_into_one_flat_sequence():
 
     _assert_rope_matches_eager_dtype_contract(rope)
     _assert_output_shapes(img_out, txt_out)
-    # Identity out-projections make the outputs slices of the flat result.
-    assert torch.equal(txt_out[0, : REAL_TXT_LENS[0]], query[: REAL_TXT_LENS[0]].flatten(1, 2))
-    assert torch.equal(img_out[0], query[REAL_TXT_LENS[0] : REAL_TXT_LENS[0] + CHUNK_SIZE].flatten(1, 2))
+    # The recovered rows come from the packed result: the varlen stub writes
+    # q + per-document K/V means, so check against the same reference.
+    flat = _segment_mean_flat(query, call["key"], call["value"], call["cu_seqlens"])
+    # Text rows are recovered in request order: req0's text opens the packed
+    # layout, req1's text opens at its own request offset.
+    req0_txt = flat[: REAL_TXT_LENS[0]]
+    req1_txt = flat[REQ_LENS[0] : REQ_LENS[0] + REAL_TXT_LENS[1]]
+    assert torch.equal(txt_out[0, : REAL_TXT_LENS[0]], req0_txt.flatten(1, 2))
+    assert torch.equal(txt_out[1, : REAL_TXT_LENS[1]], req1_txt.flatten(1, 2))
+    # req0's image chunks sit right after its text rows in the packed layout.
+    assert torch.equal(img_out[0], flat[REAL_TXT_LENS[0] : REAL_TXT_LENS[0] + CHUNK_SIZE].flatten(1, 2))
 
 
-def test_forward_mixfusion_dense_fallback_runs_each_request_independently():
+def test_forward_mixfusion_bucketed_fallback_matches_the_varlen_result():
+    # The model no longer picks a route itself: the same forward_packed call
+    # must serve backends without packed varlen support through the layer's
+    # bucketed dense fallback, and the recovered outputs must match what a
+    # single varlen kernel over the same packing would produce.
+    varlen_attn = _PackedAttentionStub(mode="varlen")
+    varlen_module = _mixfusion_module(attn=varlen_attn, rope=_CapturingRope())
+    varlen_img_out, varlen_txt_out = _forward(varlen_module)
+
+    bucketed_attn = _PackedAttentionStub(mode="bucketed")
     rope = _CapturingRope()
-    module, attn_calls = _mixfusion_module(flat_varlen=False, rope=rope)
+    bucketed_module = _mixfusion_module(attn=bucketed_attn, rope=rope)
+    img_out, txt_out = _forward(bucketed_module)
 
-    img_out, txt_out = _forward(module)
-
-    # Backends without flat varlen support still get one dense call per
-    # request, with that request's own text + image sequence.
-    assert len(attn_calls) == len(REQ_LENS)
-    for req_idx, (query, key, value, metadata) in enumerate(attn_calls):
-        assert query.shape == (1, REQ_LENS[req_idx], HEADS, HEAD_DIM)
-        assert key.shape == (1, REQ_LENS[req_idx], KV_HEADS, HEAD_DIM)
-        assert value.shape == (1, REQ_LENS[req_idx], KV_HEADS, HEAD_DIM)
-        assert not metadata.is_varlen
+    # Same single packed call; equal-length documents would share a bucket,
+    # but 11 and 17 differ so each dense forward holds one request.
+    assert len(bucketed_attn.calls) == 1
+    assert sorted(bucketed_attn.dense_shapes) == [
+        (1, REQ_LENS[0], HEADS, HEAD_DIM),
+        (1, REQ_LENS[1], HEADS, HEAD_DIM),
+    ]
+    assert torch.equal(img_out, varlen_img_out)
+    assert torch.equal(txt_out, varlen_txt_out)
 
     _assert_rope_matches_eager_dtype_contract(rope)
     _assert_output_shapes(img_out, txt_out)
