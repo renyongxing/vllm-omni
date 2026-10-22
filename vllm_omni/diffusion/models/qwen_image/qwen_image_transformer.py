@@ -60,7 +60,6 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -913,23 +912,6 @@ class QwenImageCrossAttention(nn.Module):
 
         return img_attn_output, txt_attn_output
 
-    def _supports_flat_varlen_attention(self) -> bool:
-        """Whether self.attn actually dispatches packed multi-document varlen.
-
-        ``FlashAttentionImpl._forward_varlen_flat`` exists on every platform,
-        but only forward_cuda/forward_xpu honor ``AttentionMetadata.is_varlen``.
-        NPU's forward ignores it (mindiesd path + two-document npu_attn_varlen
-        contract), so packed N-document Q/K/V there would attend across
-        request boundaries.
-        """
-        if not hasattr(getattr(self.attn, "attention", None), "_forward_varlen_flat"):
-            return False
-        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
-
-        if current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa():
-            return flash_attn_varlen_func is not None
-        return current_omni_platform.is_xpu() and flash_attn_varlen_func is not None
-
     def forward_mixfusion(
         self,
         image_chunks: torch.Tensor,
@@ -1007,78 +989,38 @@ class QwenImageCrossAttention(nn.Module):
         joint_key = torch.cat(flat_keys, dim=0)
         joint_value = torch.cat(flat_values, dim=0)
 
-        varlen_backend = self._supports_flat_varlen_attention()
         num_requests = encoder_hidden_states.shape[0]
-        if varlen_backend:
-            attn_metadata = AttentionMetadata(
-                is_varlen=True,
-                q_cu_seqlens=plan.cu_seqlens_tensor,
-                kv_cu_seqlens=plan.cu_seqlens_tensor,
-                max_q_len=plan.max_seq_len,
-                max_kv_len=plan.max_seq_len,
-                padded_tokens=0,
-            )
-            joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
+        del flat_queries, flat_keys, flat_values
 
-            # Recover rows with one gather each: text rows in request order,
-            # image rows in chunk order. No mask -> the text gather is already
-            # the padded layout, just reshape; otherwise copy into a zero
-            # buffer at the precomputed padded positions.
-            txt_rows = joint_hidden_states.index_select(0, plan.txt_out_idx)
-            img_rows = joint_hidden_states.index_select(0, plan.img_out_idx)
-            if plan.txt_pad_idx is None:
-                txt_attn_output = txt_rows.view(num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim)
-            else:
-                txt_buffer = txt_rows.new_zeros(
-                    num_requests * plan.seq_len_txt, self.add_query_num_heads, self.head_dim
-                )
-                txt_buffer.index_copy_(0, plan.txt_pad_idx, txt_rows)
-                txt_attn_output = txt_buffer.view(
-                    num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim
-                )
-            img_attn_output = img_rows.view(image_chunks.shape[0], plan.chunk_size, self.query_num_heads, self.head_dim)
+        # One packed forward: the attention layer routes varlen-capable
+        # backends to a single varlen kernel and serves every other backend
+        # with equal-length bucketed dense attention that keeps the same
+        # document isolation. Either way the result is the flat joint layout.
+        joint_hidden_states = self.attn.forward_packed(
+            joint_query,
+            joint_key,
+            joint_value,
+            cu_seqlens=plan.cu_seqlens_tensor,
+            max_seqlen=plan.max_seq_len,
+        )
+
+        # Recover rows with one gather each: text rows in request order,
+        # image rows in chunk order. No mask -> the text gather is already
+        # the padded layout, just reshape; otherwise copy into a zero
+        # buffer at the precomputed padded positions.
+        txt_rows = joint_hidden_states.index_select(0, plan.txt_out_idx)
+        img_rows = joint_hidden_states.index_select(0, plan.img_out_idx)
+        if plan.txt_pad_idx is None:
+            txt_attn_output = txt_rows.view(num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim)
         else:
-            # The selected backend cannot handle flat varlen inputs. Fall back
-            # to per-request dense attention: run each request independently
-            # with its own text + image sequence so any dense backend works.
-            # q/k are already normed and rotated; flat_queries/keys carry the
-            # per-request "text + image" order.
-            dense_metadata = AttentionMetadata()
-            text_outputs: list[torch.Tensor] = []
-            image_outputs: list[torch.Tensor | None] = [None] * image_chunks.shape[0]
-            for req_idx, (chunk_start, chunk_end) in enumerate(plan.request_chunk_ranges):
-                req_out = self.attn(
-                    flat_queries[req_idx].unsqueeze(0),
-                    flat_keys[req_idx].unsqueeze(0),
-                    flat_values[req_idx].unsqueeze(0),
-                    dense_metadata,
-                )
-                txt_len = int(plan.real_txt_lens[req_idx])
-                text_outputs.append(req_out[:, :txt_len])
-                image_output = req_out[:, txt_len:].reshape(
-                    chunk_end - chunk_start,
-                    plan.chunk_size,
-                    self.query_num_heads,
-                    self.head_dim,
-                )
-                for local_chunk_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
-                    image_outputs[chunk_idx] = image_output[local_chunk_idx : local_chunk_idx + 1]
-
-            # Re-pad per-request text outputs to the padded text length so the
-            # residual add and downstream text projections stay shape-compatible.
-            # Padded positions get zero output, identical to the mask-unpad path.
-            padded_text_outputs: list[torch.Tensor] = []
-            for req_idx in range(num_requests):
-                out = text_outputs[req_idx]
-                if out.shape[1] < plan.seq_len_txt:
-                    out = torch.cat(
-                        [out, out.new_zeros((1, plan.seq_len_txt - out.shape[1], out.shape[2], out.shape[3]))],
-                        dim=1,
-                    )
-                padded_text_outputs.append(out)
-
-            txt_attn_output = torch.cat(padded_text_outputs, dim=0)
-            img_attn_output = torch.cat([out for out in image_outputs if out is not None], dim=0)
+            txt_buffer = txt_rows.new_zeros(
+                num_requests * plan.seq_len_txt, self.add_query_num_heads, self.head_dim
+            )
+            txt_buffer.index_copy_(0, plan.txt_pad_idx, txt_rows)
+            txt_attn_output = txt_buffer.view(
+                num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim
+            )
+        img_attn_output = img_rows.view(image_chunks.shape[0], plan.chunk_size, self.query_num_heads, self.head_dim)
 
         txt_attn_output = txt_attn_output.flatten(2, 3).to(txt_query.dtype)
         img_attn_output = img_attn_output.flatten(2, 3).to(img_query.dtype)

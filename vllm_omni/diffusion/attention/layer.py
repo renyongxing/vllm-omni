@@ -455,6 +455,114 @@ class Attention(nn.Module):
 
         return self._forward_impl(query, key, value, attn_metadata)
 
+    def supports_multi_doc_packed_varlen(self) -> bool:
+        """Whether one forward can isolate N packed documents via cu_seqlens.
+
+        Delegates to the selected backend class. Custom attention modules
+        carry no backend, so they conservatively report ``False`` and
+        ``forward_packed`` serves them through the dense fallback.
+        """
+        if self.attn_backend is None:
+            return False
+        return bool(self.attn_backend.supports_multi_doc_packed_varlen())
+
+    def forward_packed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Run attention over a flat concatenation of N documents.
+
+        ``query``/``key``/``value`` hold the packed documents in
+        ``[total_tokens, heads, head_dim]`` (or the equivalent
+        ``[1, total_tokens, heads, head_dim]`` row). ``cu_seqlens`` are the
+        cumulative document boundaries; documents never attend across them.
+        The result keeps the input layout.
+
+        Backends advertising ``supports_multi_doc_packed_varlen`` receive a
+        single varlen forward. Every other backend -- custom attention
+        modules included -- is served by an equal-length bucketed dense
+        fallback with the same document-isolation semantics.
+        """
+        if query.ndim == 4 and key.ndim == 4 and value.ndim == 4:
+            if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
+                raise ValueError(
+                    f"forward_packed expects a flat or [1, total_tokens, heads, head_dim] "
+                    f"packing, got batch size {query.shape[0]}"
+                )
+            out = self._forward_packed_flat(
+                query.flatten(0, 1), key.flatten(0, 1), value.flatten(0, 1),
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            return out.reshape(query.shape)
+        if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+            raise ValueError(
+                f"forward_packed expects flat [total_tokens, heads, head_dim] Q/K/V, "
+                f"got ndim={query.ndim}/{key.ndim}/{value.ndim}"
+            )
+        return self._forward_packed_flat(query, key, value, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+
+    def _forward_packed_flat(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        if self.supports_multi_doc_packed_varlen():
+            metadata = AttentionMetadata(extra={
+                "cu_seqlens_q": cu_seqlens,
+                "cu_seqlens_k": cu_seqlens,
+                "max_seqlen_q": max_seqlen,
+                "max_seqlen_k": max_seqlen,
+                "attention_mask_mode": "none",
+            })
+            return self.forward(query, key, value, metadata)
+        return self._forward_packed_dense_buckets(query, key, value, cu_seqlens)
+
+    def _forward_packed_dense_buckets(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Serve packed documents with mask-free dense attention, by length.
+
+        Documents sharing a sequence length are stacked into one dense
+        ``[m, L, heads, head_dim]`` forward; the outputs scatter back into
+        the flat layout, so no attention crosses a document boundary even
+        though the underlying backend never sees cu_seqlens.
+        """
+        seqlens = cu_seqlens.diff().tolist()
+        nonempty = [length for length in seqlens if length > 0]
+        if not nonempty:
+            raise ValueError("cu_seqlens must describe at least one nonempty document")
+        buckets: dict[int, list[int]] = {}
+        for segment, length in enumerate(seqlens):
+            if length > 0:
+                buckets.setdefault(length, []).append(segment)
+        cu = cu_seqlens.to(device=query.device, dtype=torch.long)
+        out = torch.empty_like(query)
+        for length, segments in buckets.items():
+            rows = cu[segments].unsqueeze(1) + torch.arange(length, device=query.device)
+            flat_rows = rows.reshape(-1)
+            # Q and K/V may carry different head counts; each gets its own
+            # bucket shape and scatters back to its own flat layout.
+            bucket_out = self.forward(
+                query.index_select(0, flat_rows).reshape(len(segments), length, *query.shape[1:]),
+                key.index_select(0, flat_rows).reshape(len(segments), length, *key.shape[1:]),
+                value.index_select(0, flat_rows).reshape(len(segments), length, *value.shape[1:]),
+                AttentionMetadata(),
+            )
+            out.index_copy_(0, flat_rows, bucket_out.reshape(flat_rows.shape[0], *query.shape[1:]))
+        return out
+
     def _uses_hsdp_compile_boundary(self) -> bool:
         if self._hsdp_compile_boundary_enabled:
             return True
