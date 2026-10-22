@@ -1304,9 +1304,17 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             input_batch.latents = [state.latents for state in states if state.latents is not None]
             self.input_batch = input_batch
             scatter_latents(states, input_batch)
-            for state in states:
-                if interrupted or state.request_denoise_completed:
-                    self.state_cache.pop(state.request_id, None)
+            # Include per-request errors, whose cache entries were already removed.
+            # Releasing (rather than popping the cache directly) also calls
+            # pipeline.release_step_request() and invalidates input_batch when a
+            # retired request is still in it, matching the tensor branch below.
+            self.release_step_requests(
+                [
+                    state.request_id
+                    for state in states
+                    if interrupted or state.request_denoise_completed or state.request_id not in self.state_cache
+                ]
+            )
             return
 
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
