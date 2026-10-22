@@ -1068,13 +1068,9 @@ class QwenImageCrossAttention(nn.Module):
         if plan.txt_pad_idx is None:
             txt_attn_output = txt_rows.view(num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim)
         else:
-            txt_buffer = txt_rows.new_zeros(
-                num_requests * plan.seq_len_txt, self.add_query_num_heads, self.head_dim
-            )
+            txt_buffer = txt_rows.new_zeros(num_requests * plan.seq_len_txt, self.add_query_num_heads, self.head_dim)
             txt_buffer.index_copy_(0, plan.txt_pad_idx, txt_rows)
-            txt_attn_output = txt_buffer.view(
-                num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim
-            )
+            txt_attn_output = txt_buffer.view(num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim)
         img_attn_output = img_rows.view(image_chunks.shape[0], plan.chunk_size, self.query_num_heads, self.head_dim)
 
         txt_attn_output = txt_attn_output.flatten(2, 3).to(txt_query.dtype)

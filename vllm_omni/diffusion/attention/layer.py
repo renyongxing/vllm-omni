@@ -495,8 +495,12 @@ class Attention(nn.Module):
                     f"packing, got batch size {query.shape[0]}"
                 )
             out = self._forward_packed_flat(
-                query.flatten(0, 1), key.flatten(0, 1), value.flatten(0, 1),
-                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                query.flatten(0, 1),
+                key.flatten(0, 1),
+                value.flatten(0, 1),
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
             return out.reshape(query.shape)
         if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
             raise ValueError(
@@ -515,13 +519,15 @@ class Attention(nn.Module):
         max_seqlen: int,
     ) -> torch.Tensor:
         if self.supports_multi_doc_packed_varlen():
-            metadata = AttentionMetadata(extra={
-                "cu_seqlens_q": cu_seqlens,
-                "cu_seqlens_k": cu_seqlens,
-                "max_seqlen_q": max_seqlen,
-                "max_seqlen_k": max_seqlen,
-                "attention_mask_mode": "none",
-            })
+            metadata = AttentionMetadata(
+                extra={
+                    "cu_seqlens_q": cu_seqlens,
+                    "cu_seqlens_k": cu_seqlens,
+                    "max_seqlen_q": max_seqlen,
+                    "max_seqlen_k": max_seqlen,
+                    "attention_mask_mode": "none",
+                }
+            )
             return self.forward(query, key, value, metadata)
         return self._forward_packed_dense_buckets(query, key, value, cu_seqlens)
 

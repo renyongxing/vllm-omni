@@ -379,9 +379,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if bool(getattr(self.od_config, "enable_mixfusion", False)) and not getattr(
             self.od_config, "step_execution", False
         ):
-            logger.warning(
-                "enable_mixfusion=True requires step_execution=True; enabling step execution."
-            )
+            logger.warning("enable_mixfusion=True requires step_execution=True; enabling step execution.")
             self.od_config.step_execution = True
 
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():

@@ -135,9 +135,10 @@ def test_packed_rejects_multi_row_layouts(monkeypatch, batch, match):
 
     with pytest.raises(ValueError, match=match):
         _impl()._forward_varlen_packed(
-            query.unsqueeze(0).expand(batch, -1, -1, -1).reshape(batch * TOTAL_Q, HEADS, HEAD_DIM).view(
-                batch, TOTAL_Q, HEADS, HEAD_DIM
-            ),
+            query.unsqueeze(0)
+            .expand(batch, -1, -1, -1)
+            .reshape(batch * TOTAL_Q, HEADS, HEAD_DIM)
+            .view(batch, TOTAL_Q, HEADS, HEAD_DIM),
             key.unsqueeze(0),
             value.unsqueeze(0),
             cu_seqlens_q=torch.tensor([0, TOTAL_Q], dtype=torch.int32),

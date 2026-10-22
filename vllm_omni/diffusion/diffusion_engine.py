@@ -400,9 +400,7 @@ class DiffusionEngine:
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
         if bool(getattr(od_config, "enable_mixfusion", False)) and not self.step_execution:
-            logger.warning(
-                "enable_mixfusion=True requires step_execution=True; enabling step execution."
-            )
+            logger.warning("enable_mixfusion=True requires step_execution=True; enabling step execution.")
             od_config.step_execution = True
             self.step_execution = True
         if od_config.streaming_output and not self.step_execution:
