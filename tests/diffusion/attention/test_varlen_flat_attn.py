@@ -25,6 +25,7 @@ import torch
 import vllm_omni.diffusion.attention.backends.utils.fa as fa_module
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import (
+    FlashAttentionBackend,
     FlashAttentionImpl,
     _normalize_flash_attention_metadata,
 )
@@ -175,6 +176,14 @@ def test_incomplete_packed_extra_keys_are_rejected(drop):
         _normalize_flash_attention_metadata(AttentionMetadata(extra=extra))
 
 
+def test_flash_capability_rejects_quantized_policies():
+    # The FA3 quantized path (forward_fa_quant_cuda) is a dense BSHD kernel:
+    # _validate_quant_request_cuda rejects cu_seqlens metadata. The dtype
+    # gate runs before any platform or import lookup, so the answer holds on
+    # every platform.
+    assert FlashAttentionBackend.supports_multi_doc_packed_varlen("fp8") is False
+
+
 @pytest.mark.parametrize("forward_name", ["forward_cuda", "forward_xpu"])
 def test_packed_metadata_dispatches_to_the_packed_path(monkeypatch, forward_name):
     monkeypatch.setattr(fa_module, "HAS_FLASH_ATTN", True)
@@ -233,20 +242,28 @@ def test_xpu_keeps_the_masked_path_when_a_mask_rides_along(monkeypatch):
 
 class _VarlenBackend:
     @classmethod
-    def supports_multi_doc_packed_varlen(cls) -> bool:
-        return True
+    def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
+        # Mirrors the Flash rule: the quantized kernel rejects cu_seqlens
+        # metadata, so only a dequantized policy keeps the varlen path.
+        return kv_cache_dtype in (None, "float", "auto")
 
 
 class _DenseBackend:
     @classmethod
-    def supports_multi_doc_packed_varlen(cls) -> bool:
+    def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
         return False
 
 
-def _layer(backend, forward):
+def _layer(backend, forward, kv_cache_dtype=None, disable_kv_quant=False):
     layer = Attention.__new__(Attention)
     object.__setattr__(layer, "attn_backend", backend)
     object.__setattr__(layer, "forward", forward)
+    # Quantization-policy attributes consulted by _effective_kv_cache_dtype.
+    object.__setattr__(layer, "_kv_cache_dtype", kv_cache_dtype)
+    object.__setattr__(layer, "_disable_kv_quant", disable_kv_quant)
+    object.__setattr__(layer, "_kv_cache_skip_steps", None)
+    object.__setattr__(layer, "_kv_cache_skip_layers", None)
+    object.__setattr__(layer, "layer_idx", None)
     return layer
 
 
@@ -254,6 +271,13 @@ def test_layer_capability_delegates_to_the_backend_class():
     assert _layer(None, None).supports_multi_doc_packed_varlen() is False
     assert _layer(_VarlenBackend, None).supports_multi_doc_packed_varlen() is True
     assert _layer(_DenseBackend, None).supports_multi_doc_packed_varlen() is False
+
+
+def test_layer_capability_passes_the_quantization_policy():
+    layer = _layer(_VarlenBackend, None)
+    assert layer.supports_multi_doc_packed_varlen("float") is True
+    assert layer.supports_multi_doc_packed_varlen("auto") is True
+    assert layer.supports_multi_doc_packed_varlen("fp8") is False
 
 
 def test_forward_packed_routes_capability_to_one_varlen_forward():
@@ -269,10 +293,17 @@ def test_forward_packed_routes_capability_to_one_varlen_forward():
 
     out = layer.forward_packed(query, key, value, cu_seqlens=cu_seqlens, max_seqlen=8)
 
-    assert out is query
+    assert out.shape == query.shape
+    assert torch.equal(out, query)
     assert len(calls) == 1
     called_query, called_key, called_value, metadata = calls[0]
-    assert called_query is query
+    # The native path hands the backend a [1, total_tokens, heads, head_dim]
+    # packed row (TRTLLM's forward_cuda unpacks a 4-D query) and restores the
+    # flat packing on the way out.
+    assert called_query.shape == (1, TOTAL_Q, HEADS, HEAD_DIM)
+    assert torch.equal(called_query, query.unsqueeze(0))
+    assert torch.equal(called_key, key.unsqueeze(0))
+    assert torch.equal(called_value, value.unsqueeze(0))
     assert metadata.attn_mask is None
     assert torch.equal(metadata.extra["cu_seqlens_q"], cu_seqlens)
     assert torch.equal(metadata.extra["cu_seqlens_k"], cu_seqlens)
@@ -337,9 +368,54 @@ def test_forward_packed_dense_buckets_skip_empty_documents():
     assert torch.equal(out, query)
 
 
+def test_quantized_policy_falls_back_to_dense_buckets():
+    # A non-float effective quantization policy cannot ride the varlen
+    # kernel (the FA3 quantized path rejects cu_seqlens metadata), so the
+    # dispatcher must serve it through the dense bucket fallback instead of
+    # crashing inside the quantized kernel.
+    dense_shapes: list = []
+
+    def dense_forward(query, key, value, attn_metadata):
+        assert "cu_seqlens_q" not in attn_metadata.extra
+        dense_shapes.append(tuple(query.shape))
+        return query + key.mean(dim=1, keepdim=True) + value.mean(dim=1, keepdim=True)
+
+    layer = _layer(_VarlenBackend, dense_forward, kv_cache_dtype="fp8")
+    query, key, value = _flat_qkv()
+    cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+
+    out = layer.forward_packed(query, key, value, cu_seqlens=cu_seqlens, max_seqlen=4)
+
+    assert torch.equal(out, _segment_mean_flat(query, key, value, cu_seqlens))
+    # The two length-4 documents share one equal-length dense bucket.
+    assert dense_shapes == [(2, 4, HEADS, HEAD_DIM)]
+
+
+def test_disabled_quant_policy_keeps_the_varlen_path():
+    # _disable_kv_quant makes the effective policy "float", which the varlen
+    # path accepts.
+    calls: list = []
+
+    def varlen_forward(query, key, value, attn_metadata):
+        calls.append((query.shape, attn_metadata))
+        return query
+
+    layer = _layer(_VarlenBackend, varlen_forward, kv_cache_dtype="fp8", disable_kv_quant=True)
+    query, key, value = _flat_qkv()
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    out = layer.forward_packed(query, key, value, cu_seqlens=cu_seqlens, max_seqlen=8)
+
+    assert len(calls) == 1
+    assert calls[0][0] == (1, TOTAL_Q, HEADS, HEAD_DIM)
+    assert torch.equal(calls[0][1].extra["cu_seqlens_q"], cu_seqlens)
+    assert out.shape == query.shape
+    assert torch.equal(out, query)
+
+
 def test_forward_packed_accepts_the_single_packed_row_layout():
     def varlen_forward(query, key, value, attn_metadata):
-        assert query.ndim == 3
+        assert query.ndim == 4 and query.shape[0] == 1
         return query
 
     layer = _layer(_VarlenBackend, varlen_forward)

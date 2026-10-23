@@ -185,7 +185,7 @@ class FlashAttentionBackend(AttentionBackend):
         return current_omni_platform.is_cuda() or current_omni_platform.is_npu()
 
     @classmethod
-    def supports_multi_doc_packed_varlen(cls) -> bool:
+    def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
         # CUDA / ROCm / MUSA / XPU all dispatch ``_forward_varlen_packed`` ->
         # ``flash_attn_varlen_func`` over the caller's cu_seqlens without a
         # mask, so an arbitrary N-document packing keeps its boundaries.
@@ -194,6 +194,13 @@ class FlashAttentionBackend(AttentionBackend):
         # otherwise falls back to a padding-mask rebuild that spans the whole
         # packed row, so N>=2 real documents would silently attend across
         # request boundaries; NPU stays False here.
+        # The quantized path (``forward_fa_quant_cuda``) is a dense BSHD
+        # kernel: ``_validate_quant_request_cuda`` rejects cu_seqlens
+        # metadata, so a non-float effective policy must use the dense
+        # fallback. Checked first so the answer is testable without an
+        # accelerator.
+        if kv_cache_dtype not in (None, "float", "auto"):
+            return False
         if current_omni_platform.is_npu():
             return False
         from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func

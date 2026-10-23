@@ -422,13 +422,23 @@ class Attention(nn.Module):
                 return False
         return True
 
+    def _effective_kv_cache_dtype(self) -> str | None:
+        """The quantization policy this forward would run attention with.
+
+        None means dequantized (unset, "float" or "auto"); a policy disabled
+        by ``_disable_kv_quant`` or the skip rules reports "float". Mirrors
+        what ``_with_kv_cache_dtype`` would inject, without touching metadata,
+        so capability checks can gate on the same policy.
+        """
+        dtype = getattr(self, "_kv_cache_dtype", None)
+        if dtype in (None, "float", "auto"):
+            return None
+        if getattr(self, "_disable_kv_quant", False) or not self._should_apply_kv_cache_quant():
+            return "float"
+        return dtype
+
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
-        disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
-        dtype = self._kv_cache_dtype
-        if dtype in (None, "float"):
-            dtype = None
-        elif disabled:
-            dtype = "float"
+        dtype = self._effective_kv_cache_dtype()
         if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
             return attn_metadata
         extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
@@ -455,16 +465,19 @@ class Attention(nn.Module):
 
         return self._forward_impl(query, key, value, attn_metadata)
 
-    def supports_multi_doc_packed_varlen(self) -> bool:
+    def supports_multi_doc_packed_varlen(self, kv_cache_dtype: str | None = None) -> bool:
         """Whether one forward can isolate N packed documents via cu_seqlens.
 
         Delegates to the selected backend class. Custom attention modules
         carry no backend, so they conservatively report ``False`` and
         ``forward_packed`` serves them through the dense fallback.
+        ``kv_cache_dtype`` is the effective quantization policy of the planned
+        forward; backends whose quantized kernel cannot consume packed
+        cu_seqlens metadata report ``False`` for it.
         """
         if self.attn_backend is None:
             return False
-        return bool(self.attn_backend.supports_multi_doc_packed_varlen())
+        return bool(self.attn_backend.supports_multi_doc_packed_varlen(kv_cache_dtype=kv_cache_dtype))
 
     def forward_packed(
         self,
@@ -483,10 +496,12 @@ class Attention(nn.Module):
         cumulative document boundaries; documents never attend across them.
         The result keeps the input layout.
 
-        Backends advertising ``supports_multi_doc_packed_varlen`` receive a
-        single varlen forward. Every other backend -- custom attention
-        modules included -- is served by an equal-length bucketed dense
-        fallback with the same document-isolation semantics.
+        Backends advertising ``supports_multi_doc_packed_varlen`` for the
+        current effective quantization policy receive a single varlen
+        forward. Every other backend -- custom attention modules, or a
+        quantized policy whose kernel cannot consume cu_seqlens metadata --
+        is served by an equal-length bucketed dense fallback with the same
+        document-isolation semantics.
         """
         if query.ndim == 4 and key.ndim == 4 and value.ndim == 4:
             if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
@@ -518,7 +533,7 @@ class Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        if self.supports_multi_doc_packed_varlen():
+        if self.supports_multi_doc_packed_varlen(kv_cache_dtype=self._effective_kv_cache_dtype()):
             metadata = AttentionMetadata(
                 extra={
                     "cu_seqlens_q": cu_seqlens,
@@ -528,7 +543,12 @@ class Attention(nn.Module):
                     "attention_mask_mode": "none",
                 }
             )
-            return self.forward(query, key, value, metadata)
+            # Varlen backends run the packed row as [1, total_tokens, heads,
+            # head_dim] (TRTLLM's forward_cuda unpacks a 4-D query; Flash
+            # accepts either layout and returns the one it got), and the
+            # result returns to the flat packing.
+            out = self.forward(query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0), metadata)
+            return out.reshape(query.shape)
         return self._forward_packed_dense_buckets(query, key, value, cu_seqlens)
 
     def _forward_packed_dense_buckets(
