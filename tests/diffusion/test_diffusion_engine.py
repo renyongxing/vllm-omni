@@ -18,6 +18,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import (
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
+    DiffusionBatchingConfig,
     DiffusionOutput,
     OmniDiffusionConfig,
 )
@@ -678,6 +679,57 @@ class TestMixFusionCapability:
             diffusion_engine_module.DiffusionModelRegistry,
             "_try_load_model_cls",
             lambda model_class_name: _SingleRequestPipeline,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
+
+    def test_engine_rejects_compute_budget_policy_without_mixfusion(self) -> None:
+        # iDRR admission (policy="compute_budget") is coupled to MixFusion.
+        od_config = SimpleNamespace(
+            model_class_name="MixfusionPipeline",
+            custom_pipeline_args=None,
+            enable_mixfusion=False,
+            diffusion_batching_config=DiffusionBatchingConfig(policy="compute_budget"),
+            streaming_output=False,
+            max_num_seqs=1,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        with pytest.raises(ValueError, match="requires enable_mixfusion=True"):
+            engine._resolve_execution_mode(od_config)
+
+    def test_engine_allows_compute_budget_policy_with_mixfusion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="MixfusionPipeline",
+            custom_pipeline_args=None,
+            enable_mixfusion=True,
+            diffusion_batching_config=DiffusionBatchingConfig(policy="compute_budget"),
+            streaming_output=False,
+            max_num_seqs=1,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _MixfusionCapablePipeline,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
+
+    def test_engine_allows_fixed_policy_without_mixfusion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="MixfusionPipeline",
+            custom_pipeline_args=None,
+            enable_mixfusion=False,
+            diffusion_batching_config=DiffusionBatchingConfig(policy="fixed"),
+            streaming_output=False,
+            max_num_seqs=1,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _MixfusionCapablePipeline,
         )
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
