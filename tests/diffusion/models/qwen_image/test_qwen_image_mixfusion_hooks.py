@@ -67,6 +67,9 @@ def _pipeline(transformer) -> QwenImagePipeline:
     pipeline = QwenImagePipeline.__new__(QwenImagePipeline)
     object.__setattr__(pipeline, "parallel_config", SimpleNamespace(sequence_parallel_size=1))
     object.__setattr__(pipeline, "transformer", transformer)
+    # ``attention_kwargs`` is a read-only property over ``_attention_kwargs``;
+    # default it so dispatch guards can consult it on bare fixtures.
+    object.__setattr__(pipeline, "_attention_kwargs", None)
     return pipeline
 
 

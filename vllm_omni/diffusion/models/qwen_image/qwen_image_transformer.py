@@ -1701,6 +1701,15 @@ class QwenImageTransformer2DModel(CachedTransformer):
             `tuple` where the first element is the sample tensor.
         """
         if isinstance(hidden_states, list):
+            if attention_kwargs:
+                # ``_forward_mixfusion`` has no ``attention_kwargs`` channel;
+                # refusing keeps a caller's per-attention arguments from being
+                # silently dropped on the packed path.
+                raise ValueError(
+                    "Qwen MixFusion packed forward does not consume attention_kwargs; "
+                    "pass batched tensor hidden_states (the serial path threads "
+                    "attention_kwargs into every block) or drop them."
+                )
             return self._forward_mixfusion(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
