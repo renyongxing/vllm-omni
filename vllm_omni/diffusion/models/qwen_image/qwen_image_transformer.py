@@ -6,7 +6,6 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING, Any
 
@@ -63,6 +62,13 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.mixfusion.layout import (
+    MixFusionPlan,
+    build_mixfusion_plan,
+    expand_per_chunk,
+    reassemble_chunk_rows,
+    split_sequence_chunks,
+)
 
 logger = init_logger(__name__)
 
@@ -164,69 +170,6 @@ def _qwen_image_qk_norm_rope(
         ).reshape(k.shape)
         return q, k
     return rope(q, cos, sin), rope(k, cos, sin)
-
-
-@dataclass
-class MixFusionPlan:
-    """Per-step MixFusion packing layout, computed once and shared by all blocks.
-
-    Holds the flat varlen sequence layout (cu_seqlens / max_seq_len) plus the
-    index tensors that recover per-request text rows and per-chunk image rows
-    from the packed attention output, so per-block work stays on-GPU.
-    """
-
-    cu_seqlens: list[int]
-    cu_seqlens_tensor: torch.Tensor
-    max_seq_len: int
-    request_chunk_ranges: list[tuple[int, int]]
-    real_txt_lens: list[int]
-    seq_len_txt: int
-    chunk_size: int
-    chunk_to_request: torch.Tensor
-    txt_out_idx: torch.Tensor
-    img_out_idx: torch.Tensor
-    # Target rows in the padded [num_requests * seq_len_txt] text-output space,
-    # or None when every request uses the full padded text length (no mask).
-    txt_pad_idx: torch.Tensor | None
-
-
-def build_mixfusion_plan(
-    *,
-    seq_len_txt: int,
-    chunk_size: int,
-    request_chunk_ranges: list[tuple[int, int]],
-    real_txt_lens: list[int],
-    chunk_to_request: torch.Tensor,
-    device: torch.device,
-) -> MixFusionPlan:
-    cu_seqlens = [0]
-    txt_out_rows: list[int] = []
-    img_out_rows: list[int] = []
-    txt_pad_rows: list[int] = []
-    max_seq_len = 0
-    for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
-        txt_len = int(real_txt_lens[req_idx])
-        img_len = (chunk_end - chunk_start) * chunk_size
-        base = cu_seqlens[-1]
-        txt_out_rows.extend(range(base, base + txt_len))
-        img_out_rows.extend(range(base + txt_len, base + txt_len + img_len))
-        cu_seqlens.append(base + txt_len + img_len)
-        max_seq_len = max(max_seq_len, txt_len + img_len)
-        txt_pad_rows.extend(range(req_idx * seq_len_txt, req_idx * seq_len_txt + txt_len))
-    needs_padding = any(txt_len < seq_len_txt for txt_len in real_txt_lens)
-    return MixFusionPlan(
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_tensor=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
-        max_seq_len=max_seq_len,
-        request_chunk_ranges=request_chunk_ranges,
-        real_txt_lens=real_txt_lens,
-        seq_len_txt=seq_len_txt,
-        chunk_size=chunk_size,
-        chunk_to_request=chunk_to_request,
-        txt_out_idx=torch.tensor(txt_out_rows, dtype=torch.long, device=device),
-        img_out_idx=torch.tensor(img_out_rows, dtype=torch.long, device=device),
-        txt_pad_idx=torch.tensor(txt_pad_rows, dtype=torch.long, device=device) if needs_padding else None,
-    )
 
 
 def _normalize_qwen_image_weight_name(name: str) -> str:
@@ -1570,29 +1513,24 @@ class QwenImageTransformer2DModel(CachedTransformer):
             )
 
         chunk_size = self._mixfusion_chunk_size(image_rows)
-        image_chunks: list[torch.Tensor] = []
-        image_freq_chunks: list[torch.Tensor] = []
-        chunk_to_request: list[int] = []
-        request_chunk_ranges: list[tuple[int, int]] = []
         seq_len_txt = int(encoder_hidden_states.shape[1])
+
+        # RoPE frequency tables are computed per image row on the FULL sequence
+        # (absolute positions preserved); img_shapes / txt_seq_lens are
+        # per-state, images of the same request share the same resolution and
+        # prompt. The hidden states and their freqs are then chunked under the
+        # same partition.
+        row_vid_freqs: list[torch.Tensor] = []
         text_freqs: list[torch.Tensor] = []
-
         for row_idx, sample in enumerate(image_rows):
-            seq_len = int(sample.shape[1])
-            if seq_len % chunk_size != 0:
-                raise ValueError(f"Qwen MixFusion seq_len={seq_len} is not divisible by chunk_size={chunk_size}.")
-            chunk_start = len(image_chunks)
-            image_chunks.extend(sample.split(chunk_size, dim=1))
-            chunk_end = len(image_chunks)
-            request_chunk_ranges.append((chunk_start, chunk_end))
-            chunk_to_request.extend([row_idx] * (chunk_end - chunk_start))
-
-            # img_shapes / txt_seq_lens are per-state; images of the same request
-            # share the same resolution and prompt.
             state_idx = image_row_states[row_idx]
             req_vid_freqs, req_txt_freqs = self.pos_embed(img_shapes[state_idx], [seq_len_txt], device=sample.device)
-            image_freq_chunks.extend(req_vid_freqs.split(chunk_size, dim=0))
+            row_vid_freqs.append(req_vid_freqs)
             text_freqs.append(req_txt_freqs[:seq_len_txt])
+
+        image_chunks, image_freq_chunks, request_chunk_ranges, chunk_to_request = split_sequence_chunks(
+            image_rows, row_vid_freqs, chunk_size
+        )
 
         image_chunks_tensor = torch.cat(image_chunks, dim=0)
         image_chunks_tensor = self.img_in(image_chunks_tensor)
@@ -1643,7 +1581,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 temb=temb,
             )
 
-        chunk_temb = temb.index_select(0, chunk_to_request_tensor)
+        chunk_temb = expand_per_chunk(temb, chunk_to_request_tensor)
         image_chunks_tensor = self.norm_out(image_chunks_tensor, chunk_temb)
         image_chunks_tensor = self.proj_out(image_chunks_tensor)
 
@@ -1651,17 +1589,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # whose chunks are contiguous in request_chunk_ranges. Rebuild the
         # [num_images, seq, C] latent per request to preserve the external
         # contract (one tensor per request).
-        outputs: list[torch.Tensor] = []
-        row_idx = 0
-        for sample in hidden_states:
-            num_images = int(sample.shape[0])
-            rows = []
-            for _ in range(num_images):
-                chunk_start, chunk_end = request_chunk_ranges[row_idx]
-                row_idx += 1
-                rows.append(image_chunks_tensor[chunk_start:chunk_end].reshape(1, -1, image_chunks_tensor.shape[-1]))
-            outputs.append(torch.cat(rows, dim=0) if num_images > 1 else rows[0])
-        return outputs
+        return reassemble_chunk_rows(
+            image_chunks_tensor,
+            request_chunk_ranges,
+            [int(sample.shape[0]) for sample in hidden_states],
+        )
 
     def forward(
         self,
