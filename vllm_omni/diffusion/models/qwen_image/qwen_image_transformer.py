@@ -1116,7 +1116,29 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: dict[str, Any] | None = None,
         modulate_index: list[int] | None = None,
         hidden_states_mask: torch.Tensor | None = None,
+        mixfusion_plan: MixFusionPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Layout-aware block forward.
+
+        In the default layout both streams share the batch dimension. With a
+        ``mixfusion_plan`` the image stream arrives chunk-stacked
+        (``[num_chunks, chunk_size, C]`` in ``hidden_states``, chunk-aligned
+        RoPE frequencies in ``image_rotary_emb``) while the text stream stays
+        per-request; every non-attention op below is stream-local per token,
+        so the two layouts only diverge at the attention call, which routes
+        through ``attn.forward_mixfusion`` (the attention-domain boundary).
+        """
+        if mixfusion_plan is not None and (
+            self.zero_cond_t
+            or modulate_index is not None
+            or (joint_attention_kwargs or {}).get(QK_NORM_ROPE_TABLE_KEY) is not None
+        ):
+            raise ValueError(
+                "MixFusion packed block forward does not support zero_cond_t, "
+                "modulate_index (select01) or the fused joint QK-norm-RoPE "
+                "path; fall back to the standard forward path."
+            )
+
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod(temb)  # [B, 6*dim]
 
@@ -1124,6 +1146,11 @@ class QwenImageTransformerBlock(nn.Module):
             temb = torch.chunk(temb, 2, dim=0)[0]
 
         txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
+
+        if mixfusion_plan is not None:
+            # Chunk-stacked image stream: expand per-request conditioning
+            # rows to per-chunk rows so AdaLN modulation matches the layout.
+            img_mod_params = expand_per_chunk(img_mod_params, mixfusion_plan.chunk_to_request)
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
@@ -1157,18 +1184,30 @@ class QwenImageTransformerBlock(nn.Module):
         # 2. Applies QK normalization and RoPE
         # 3. Concatenates and runs joint attention
         # 4. Splits results back to separate streams
-        attn_output = self.attn(
-            hidden_states=img_modulated,  # Image stream (will be processed as "sample")
-            encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
-            vid_freqs=image_rotary_emb[0],
-            txt_freqs=image_rotary_emb[1],
-            hidden_states_mask=hidden_states_mask,
-            encoder_hidden_states_mask=encoder_hidden_states_mask,
-            qk_norm_rope_table=(joint_attention_kwargs or {}).get(QK_NORM_ROPE_TABLE_KEY),
-        )
+        if mixfusion_plan is not None:
+            # Attention is the layout boundary: the attention module
+            # reassembles chunks per request into logical sequences and runs
+            # packed varlen attention over them.
+            img_attn_output, txt_attn_output = self.attn.forward_mixfusion(
+                image_chunks=img_modulated,
+                encoder_hidden_states=txt_modulated,
+                image_freq_chunks=image_rotary_emb[0],
+                text_freqs=image_rotary_emb[1],
+                plan=mixfusion_plan,
+            )
+        else:
+            attn_output = self.attn(
+                hidden_states=img_modulated,  # Image stream (will be processed as "sample")
+                encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
+                vid_freqs=image_rotary_emb[0],
+                txt_freqs=image_rotary_emb[1],
+                hidden_states_mask=hidden_states_mask,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                qk_norm_rope_table=(joint_attention_kwargs or {}).get(QK_NORM_ROPE_TABLE_KEY),
+            )
 
-        # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
-        img_attn_output, txt_attn_output = attn_output
+            # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
+            img_attn_output, txt_attn_output = attn_output
 
         # Apply attention gates and add residual (like in Megatron)
         hidden_states_before_attn = hidden_states
@@ -1212,54 +1251,6 @@ class QwenImageTransformerBlock(nn.Module):
             hidden_states = hidden_states.clip(-65504, 65504)
 
         return encoder_hidden_states, hidden_states
-
-    def forward_mixfusion(
-        self,
-        image_chunks: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        image_freq_chunks: torch.Tensor,
-        text_freqs: torch.Tensor,
-        plan: MixFusionPlan,
-        temb: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        img_mod_params = self.img_mod(temb)
-        txt_mod_params = self.txt_mod(temb)
-
-        img_mod_params = img_mod_params.index_select(0, plan.chunk_to_request)
-        img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
-        txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
-
-        img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1)
-        img_modulated = self.img_norm1(image_chunks, img_scale1, img_shift1)
-
-        txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
-        txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
-
-        img_attn_output, txt_attn_output = self.attn.forward_mixfusion(
-            image_chunks=img_modulated,
-            encoder_hidden_states=txt_modulated,
-            image_freq_chunks=image_freq_chunks,
-            text_freqs=text_freqs,
-            plan=plan,
-        )
-
-        image_chunks = image_chunks + img_gate1 * img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
-
-        img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2)
-        img_modulated2 = self.img_norm2(image_chunks, img_scale2, img_shift2)
-        image_chunks = image_chunks + img_gate2 * self.img_mlp(img_modulated2)
-
-        txt_scale2, txt_shift2, txt_gate2 = self._modulate(txt_mod2)
-        txt_modulated2 = self.txt_norm2(encoder_hidden_states, txt_scale2, txt_shift2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
-
-        if encoder_hidden_states.dtype == torch.float16:
-            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
-        if image_chunks.dtype == torch.float16:
-            image_chunks = image_chunks.clip(-65504, 65504)
-
-        return encoder_hidden_states, image_chunks
 
 
 # Note: inheriting from CachedTransformer only when we support caching
@@ -1446,9 +1437,9 @@ class QwenImageTransformer2DModel(CachedTransformer):
     def has_active_block_hooks(self) -> bool:
         """Whether any layerwise-offloadable block carries a registered hook.
 
-        ``_forward_mixfusion`` invokes ``block.forward_mixfusion`` directly,
-        which bypasses the HookRegistry wrapper installed around
-        ``block.forward`` and any PyTorch-native forward hooks on the block.
+        ``_forward_mixfusion`` invokes ``block.forward`` directly (instead of
+        the ``block(...)`` module call), which bypasses the HookRegistry
+        wrapper and any PyTorch-native forward hooks on the block.
         Omni hooks such as layerwise offload (block-weight prefetch) would
         therefore never fire and offloaded blocks would run with empty weight
         storage; HSDP's ``fully_shard`` registers native forward pre-hooks to
@@ -1463,7 +1454,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 # PyTorch-native hooks (e.g. FSDP2 fully_shard's unshard
                 # pre-hook) live in the module's own hook dicts, not the
                 # Omni registry, and are equally bypassed by the direct
-                # forward_mixfusion call.
+                # block.forward call.
                 if getattr(block, "_forward_pre_hooks", None) or getattr(block, "_forward_hooks", None):
                     return True
         return False
@@ -1572,13 +1563,20 @@ class QwenImageTransformer2DModel(CachedTransformer):
         )
 
         for block in self.transformer_blocks:
-            encoder_hidden_states, image_chunks_tensor = block.forward_mixfusion(
-                image_chunks=image_chunks_tensor,
+            # Mainline block forward, layout-aware: the chunk-stacked image
+            # stream rides the standard ``hidden_states`` /
+            # ``image_rotary_emb`` arguments, and the plan routes the block's
+            # attention call through ``attn.forward_mixfusion``. Called as
+            # ``block.forward`` (not ``block(...)``) to keep bypassing the
+            # nn.Module hook machinery, as guarded by
+            # ``has_active_block_hooks``.
+            encoder_hidden_states, image_chunks_tensor = block.forward(
+                hidden_states=image_chunks_tensor,
                 encoder_hidden_states=encoder_hidden_states,
-                image_freq_chunks=image_freq_chunks_tensor,
-                text_freqs=text_freqs_tensor,
-                plan=plan,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
                 temb=temb,
+                image_rotary_emb=(image_freq_chunks_tensor, text_freqs_tensor),
+                mixfusion_plan=plan,
             )
 
         chunk_temb = expand_per_chunk(temb, chunk_to_request_tensor)

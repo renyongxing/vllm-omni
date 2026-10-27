@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that ``attention_kwargs`` survive the MixFusion dispatch (CPU).
 
-The packed ``_forward_mixfusion`` drives blocks through
-``block.forward_mixfusion``, which has no ``attention_kwargs`` channel, so a
+The packed ``_forward_mixfusion`` drives blocks through the layout-aware
+``block.forward`` with a ``mixfusion_plan``, which has no
+``attention_kwargs`` channel, so a
 non-empty ``attention_kwargs`` used to be silently dropped when
 ``hidden_states`` was a list. The pipeline must fall back to the serial path
 (which threads them into every block), and a direct packed call with

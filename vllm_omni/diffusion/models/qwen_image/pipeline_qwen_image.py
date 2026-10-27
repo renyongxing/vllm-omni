@@ -1036,16 +1036,16 @@ class QwenImagePipeline(
             raise TypeError("_denoise_step_mixfusion expects list latents.")
         if input_batch.do_true_cfg or input_batch.image_latents is not None:
             return self._denoise_step_serial_ragged(input_batch)
-        # The packed forward drives blocks through ``forward_mixfusion``,
-        # which has no ``attention_kwargs`` channel; the serial path threads
-        # them into every block, so honor a caller's per-attention arguments
-        # there instead of silently dropping them.
+        # The packed forward drives blocks through the layout-aware
+        # ``block.forward``, which has no ``attention_kwargs`` channel; the
+        # serial path threads them into every block, so honor a caller's
+        # per-attention arguments there instead of silently dropping them.
         if self.attention_kwargs:
             return self._denoise_step_serial_ragged(input_batch)
         if self.parallel_config.sequence_parallel_size > 1:
             return self._denoise_step_serial_ragged(input_batch)
-        # The packed mixfusion forward calls block.forward_mixfusion directly,
-        # bypassing the block forward hooks (e.g. layerwise offload prefetch,
+        # The packed mixfusion forward calls block.forward directly (not the
+        # module call), bypassing the block forward hooks (e.g. layerwise offload prefetch,
         # or HSDP fully_shard's unshard pre-hook). The serial path routes
         # every block through the hooked module call, so it stays correct
         # under those hooks.

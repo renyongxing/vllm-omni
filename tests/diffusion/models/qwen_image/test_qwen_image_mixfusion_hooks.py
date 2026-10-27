@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the MixFusion block-forward-hook guard (CPU).
 
-``_forward_mixfusion`` invokes ``block.forward_mixfusion`` directly, which
-bypasses the HookRegistry wrapper around ``block.forward`` and any
+``_forward_mixfusion`` invokes ``block.forward`` directly (not the
+``block(...)`` module call), which bypasses the HookRegistry wrapper around
+``block.forward`` and any
 PyTorch-native forward hooks on the block; under layerwise offload only the
 first block is materialized, and under HSDP ``fully_shard`` registers native
 forward pre-hooks to all-gather sharded weights, so the packed path must

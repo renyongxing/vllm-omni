@@ -230,6 +230,30 @@ Known limitation: the packed dispatch does not thread `attention_kwargs`
 into the packed forward; features that rely on it (e.g. LoRA scales,
 TeaCache) must extend `_denoise_step_mixfusion` first.
 
+#### Layout abstraction
+
+The sequence chunking/restoration primitives are model-agnostic and live in
+`vllm_omni/diffusion/mixfusion` (`MixFusionPlan`, `build_mixfusion_plan`,
+`split_sequence_chunks`, `reassemble_chunk_rows`, `expand_per_chunk`),
+analogous to how `_sp_plan` centralizes sequence-parallel layout. A model
+adopts the layout by declaring the plan from its request metadata and
+passing it through one channel:
+
+- The transformer block forward is layout-aware: with a `mixfusion_plan`,
+  the chunk-stacked image stream rides the standard `hidden_states` /
+  `image_rotary_emb` arguments (text stays per-request), and per-request
+  conditioning rows are expanded to per-chunk rows inside the block. Norm,
+  modulation, residual and MLP code is shared with the standard path; only
+  the attention call is routed (to `attn.forward_mixfusion`).
+- Attention remains the special boundary: the packed layout has
+  image-batch = num-chunks versus text-batch = num-requests, so joint
+  attention reassembles the per-request logical domain itself instead of
+  relying on a shared batch dimension. The plan (chunk ranges, document
+  ids, padding maps) is all the attention layer needs.
+- Paths the packed layout cannot express (select01 `modulate_index`, the
+  fused joint QK-norm-RoPE table, `zero_cond_t`) are rejected by a guard
+  and must run through the standard forward.
+
 ## Model Author Guidelines
 
 When converting a request-level pipeline:
