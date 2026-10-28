@@ -42,6 +42,10 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.mixfusion.packed_attention import (
+    MIXFUSION_PLAN_KEY,
+    run_mixfusion_packed_attention,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -457,6 +461,13 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.extra.get(MIXFUSION_PLAN_KEY) is not None:
+            # MixFusion chunked layout: recover each request to
+            # ``text + full image`` right before the kernel and scatter back
+            # after it, at the same pre/post boundary the sequence-parallel
+            # strategies use around their all-to-all.
+            return run_mixfusion_packed_attention(self, query, key, value, attn_metadata)
+
         if torch.compiler.is_compiling() and self._uses_hsdp_compile_boundary():
             # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
             # attention graph; otherwise scheduler dependency analysis can

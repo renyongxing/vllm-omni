@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Packing tests for ``QwenImageCrossAttention.forward_mixfusion`` (CPU).
+"""Packing tests for the MixFusion chunked attention path (CPU).
 
 The FlashAttention kernel needs an accelerator, so these tests drive the real
-``forward_mixfusion`` packing logic with stub projections and a capturing
-``forward_packed`` stub: mixed-length requests (different text lengths and
-image chunk counts) must be flattened into one packed sequence with
-per-request ``cu_seqlens``, in each request's ``text + image`` token order,
-with RoPE cos/sin cast to the activation dtype (the eager-path contract,
-#7494). The model delegates to ``Attention.forward_packed`` once, so the
-backends that route to a varlen kernel and those served by the layer's
-bucketed dense fallback are covered through the same entry point.
+packing logic — the standard ``QwenImageCrossAttention.forward`` with a
+``mixfusion_plan``, routed through the attention layer's packed entry — with
+stub projections and a capturing ``forward_packed`` stub: mixed-length
+requests (different text lengths and image chunk counts) must be flattened
+into one packed sequence with per-request ``cu_seqlens``, in each request's
+``text + image`` token order, with RoPE cos/sin cast to the activation dtype
+(the eager-path contract, #7494). The packed entry delegates to
+``Attention.forward_packed`` once, so the backends that route to a varlen
+kernel and those served by the layer's bucketed dense fallback are covered
+through the same entry point.
 """
 
 from __future__ import annotations
@@ -21,6 +23,10 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.mixfusion.packed_attention import (
+    MIXFUSION_PLAN_KEY,
+    run_mixfusion_packed_attention,
+)
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageCrossAttention,
     build_mixfusion_plan,
@@ -97,6 +103,14 @@ class _PackedAttentionStub:
         self.calls: list[dict] = []
         self.dense_shapes: list[tuple] = []
 
+    def __call__(self, query, key, value, attn_metadata):
+        # Mirror the metadata-keyed dispatch at the top of ``Attention.forward``
+        # (the real layer routes the same way; this stub replaces the layer so
+        # the test stays on CPU).
+        if attn_metadata.extra.get(MIXFUSION_PLAN_KEY) is not None:
+            return run_mixfusion_packed_attention(self, query, key, value, attn_metadata)
+        raise AssertionError("stub reached without a mixfusion plan")
+
     def forward_packed(self, query, key, value, *, cu_seqlens, max_seqlen):
         self.calls.append(
             {
@@ -119,7 +133,7 @@ class _PackedAttentionStub:
 
 
 def _mixfusion_module(*, attn: _PackedAttentionStub, rope: _CapturingRope):
-    """A QwenImageCrossAttention with only forward_mixfusion's dependencies.
+    """A QwenImageCrossAttention with only the packed-path dependencies.
 
     Built via ``__new__`` so the vLLM parallel layers are never constructed:
     identity projections keep q/k/v rows equal to the input rows, which makes
@@ -129,6 +143,7 @@ def _mixfusion_module(*, attn: _PackedAttentionStub, rope: _CapturingRope):
 
     module = QwenImageCrossAttention.__new__(QwenImageCrossAttention)
     attrs = {
+        "parallel_config": None,
         "query_num_heads": HEADS,
         "kv_num_heads": KV_HEADS,
         "add_query_num_heads": HEADS,
@@ -172,12 +187,12 @@ def _forward(module):
         chunk_to_request=chunk_to_request,
         device=image_chunks.device,
     )
-    return module.forward_mixfusion(
-        image_chunks=image_chunks,
+    return module.forward(
+        hidden_states=image_chunks,
         encoder_hidden_states=encoder_hidden_states,
-        image_freq_chunks=image_freq_chunks,
-        text_freqs=text_freqs,
-        plan=plan,
+        vid_freqs=image_freq_chunks,
+        txt_freqs=text_freqs,
+        mixfusion_plan=plan,
     )
 
 
@@ -201,7 +216,7 @@ def _assert_output_shapes(img_out, txt_out):
     assert torch.all(txt_out[1, REAL_TXT_LENS[1] :] == 0)
 
 
-def test_forward_mixfusion_packs_mixed_requests_into_one_packed_call():
+def test_packed_attention_packs_mixed_requests_into_one_packed_call():
     attn = _PackedAttentionStub(mode="varlen")
     rope = _CapturingRope()
     module = _mixfusion_module(attn=attn, rope=rope)

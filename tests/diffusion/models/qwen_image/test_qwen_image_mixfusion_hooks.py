@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the MixFusion block-forward-hook guard (CPU).
 
-``_forward_mixfusion`` invokes ``block.forward`` directly (not the
-``block(...)`` module call), which bypasses the HookRegistry wrapper around
-``block.forward`` and any
-PyTorch-native forward hooks on the block; under layerwise offload only the
-first block is materialized, and under HSDP ``fully_shard`` registers native
-forward pre-hooks to all-gather sharded weights, so the packed path must
+The packed MixFusion path runs blocks on the chunk-stacked layout (several
+chunks per request stacked on the batch dimension), where block-hook
+semantics are unvalidated: under layerwise offload the block-weight prefetch
+step size no longer matches the request count, and HSDP's ``fully_shard``
+registers native forward pre-hooks to all-gather weights against a batch
+dimension that no longer matches the request count. The packed path must
 refuse to run while blocks carry hooks, and the pipeline must fall back to
 the serial path, whose per-request loops route every block through the hooked
 module call.
@@ -111,50 +111,44 @@ def test_has_active_block_hooks_reflects_native_block_hooks():
     assert _transformer([_PlainBlock(), _hsdp_like_block()]).has_active_block_hooks()
 
 
-def test_forward_mixfusion_rejects_hooked_blocks():
+def test_packed_forward_rejects_hooked_blocks():
     transformer = _transformer([_hooked_block()])
 
-    with pytest.raises(ValueError, match="bypasses block forward hooks"):
-        transformer._forward_mixfusion(
+    with pytest.raises(ValueError, match="hook semantics"):
+        transformer.forward(
             hidden_states=[torch.zeros(1, 8, 16)],
             encoder_hidden_states=torch.zeros(1, 4, 8),
-            encoder_hidden_states_mask=None,
             timestep=torch.zeros(1),
             img_shapes=[(16, 2, 2)],
             txt_seq_lens=[4],
-            guidance=None,
         )
 
 
-def test_forward_mixfusion_rejects_native_hooked_blocks():
+def test_packed_forward_rejects_native_hooked_blocks():
     transformer = _transformer([_hsdp_like_block()])
 
-    with pytest.raises(ValueError, match="bypasses block forward hooks"):
-        transformer._forward_mixfusion(
+    with pytest.raises(ValueError, match="hook semantics"):
+        transformer.forward(
             hidden_states=[torch.zeros(1, 8, 16)],
             encoder_hidden_states=torch.zeros(1, 4, 8),
-            encoder_hidden_states_mask=None,
             timestep=torch.zeros(1),
             img_shapes=[(16, 2, 2)],
             txt_seq_lens=[4],
-            guidance=None,
         )
 
 
-def test_forward_mixfusion_passes_the_hook_guard_without_hooks():
+def test_packed_forward_passes_the_hook_guard_without_hooks():
     # Without hooks the guard must not fire; execution continues to the
     # regular input validation (empty hidden states).
     transformer = _transformer([_PlainBlock()])
 
     with pytest.raises(ValueError, match="at least one hidden-state tensor"):
-        transformer._forward_mixfusion(
+        transformer.forward(
             hidden_states=[],
             encoder_hidden_states=torch.zeros(1, 4, 8),
-            encoder_hidden_states_mask=None,
             timestep=torch.zeros(1),
             img_shapes=[(16, 2, 2)],
             txt_seq_lens=[4],
-            guidance=None,
         )
 
 
