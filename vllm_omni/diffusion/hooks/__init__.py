@@ -8,6 +8,14 @@ from vllm_omni.diffusion.hooks.base import (
     StateManager,
     module_has_active_hooks,
 )
+from vllm_omni.diffusion.hooks.mixfusion import (
+    MixFusionExpandArgHook,
+    MixFusionExpandRowsHook,
+    MixFusionRootHook,
+    MixFusionRopePrepareHook,
+    apply_mixfusion,
+    remove_mixfusion,
+)
 from vllm_omni.diffusion.hooks.sequence_parallel import (
     SequenceParallelGatherHook,
     SequenceParallelSplitHook,
@@ -26,4 +34,11 @@ __all__ = [
     "SequenceParallelGatherHook",
     "apply_sequence_parallel",
     "remove_sequence_parallel",
+    # MixFusion packed-layout hooks (same mechanism as the SP hooks above)
+    "MixFusionRootHook",
+    "MixFusionRopePrepareHook",
+    "MixFusionExpandRowsHook",
+    "MixFusionExpandArgHook",
+    "apply_mixfusion",
+    "remove_mixfusion",
 ]
