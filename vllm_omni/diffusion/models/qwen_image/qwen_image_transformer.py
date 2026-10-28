@@ -41,12 +41,22 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.mixfusion_plan import (
+    MixFusionExpandArg,
+    MixFusionExpandRows,
+    MixFusionRoot,
+    MixFusionRopePrepare,
+)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.hooks import module_has_active_hooks
+from vllm_omni.diffusion.hooks.mixfusion import MIXFUSION_PACK_HOOK_NAME
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     QK_NORM_ROPE_TABLE_KEY,
@@ -66,8 +76,6 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.mixfusion.layout import (
     MixFusionPlan,
     build_mixfusion_plan,
-    expand_per_chunk,
-    reassemble_chunk_rows,
     split_sequence_chunks,
 )
 from vllm_omni.diffusion.mixfusion.packed_attention import MIXFUSION_PLAN_KEY
@@ -98,6 +106,11 @@ def _packed_qk_norm_rope_table(
     kernel would not run or the joint sequence ``B*(S_txt+S_img)`` is below the
     gate.
     """
+    if is_forward_context_available() and get_forward_context().mixfusion_step is not None:
+        # The packed path has no fused joint QK-norm-RoPE table: text is
+        # per-request while image rows are per-chunk, so one table cannot
+        # serve both streams.
+        return None
     freqs = torch.cat((txt_freqs, vid_freqs), dim=0)
     if batch_size * freqs.shape[0] < _fused_min_tokens():
         return None
@@ -789,8 +802,17 @@ class QwenImageCrossAttention(nn.Module):
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
         qk_norm_rope_table: torch.Tensor | None = None,
-        mixfusion_plan: MixFusionPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The packed MixFusion plan travels on the forward context (armed by
+        # the pipeline's `_denoise_step_mixfusion`, filled by the root hook)
+        # so this signature stays free of MixFusion threading. No context / no
+        # armed step (serial forwards, unit tests) means the packed branch
+        # below stays dormant.
+        mixfusion_plan = None
+        if is_forward_context_available():
+            step = get_forward_context().mixfusion_step
+            if step is not None:
+                mixfusion_plan = step.plan
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
         kv_size = self.kv_num_heads * self.head_dim
@@ -1026,30 +1048,7 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: dict[str, Any] | None = None,
         modulate_index: list[int] | None = None,
         hidden_states_mask: torch.Tensor | None = None,
-        mixfusion_plan: MixFusionPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Layout-aware block forward.
-
-        In the default layout both streams share the batch dimension. With a
-        ``mixfusion_plan`` the image stream arrives chunk-stacked
-        (``[num_chunks, chunk_size, C]`` in ``hidden_states``, chunk-aligned
-        RoPE frequencies in ``image_rotary_emb``) while the text stream stays
-        per-request; every non-attention op below is stream-local per token,
-        so the two layouts only diverge at the attention call, which routes
-        through the standard forward with the plan riding the attention
-        metadata (the attention-domain boundary).
-        """
-        if mixfusion_plan is not None and (
-            self.zero_cond_t
-            or modulate_index is not None
-            or (joint_attention_kwargs or {}).get(QK_NORM_ROPE_TABLE_KEY) is not None
-        ):
-            raise ValueError(
-                "MixFusion packed block forward does not support zero_cond_t, "
-                "modulate_index (select01) or the fused joint QK-norm-RoPE "
-                "path; fall back to the standard forward path."
-            )
-
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod(temb)  # [B, 6*dim]
 
@@ -1057,11 +1056,6 @@ class QwenImageTransformerBlock(nn.Module):
             temb = torch.chunk(temb, 2, dim=0)[0]
 
         txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
-
-        if mixfusion_plan is not None:
-            # Chunk-stacked image stream: expand per-request conditioning
-            # rows to per-chunk rows so AdaLN modulation matches the layout.
-            img_mod_params = expand_per_chunk(img_mod_params, mixfusion_plan.chunk_to_request)
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
@@ -1095,10 +1089,6 @@ class QwenImageTransformerBlock(nn.Module):
         # 2. Applies QK normalization and RoPE
         # 3. Concatenates and runs joint attention
         # 4. Splits results back to separate streams
-        # Use the standard attention call for both layouts: with a
-        # ``mixfusion_plan`` the attention module reassembles chunks per
-        # request inside the attention layer (the SP all-to-all position);
-        # without one both streams share the batch dimension.
         attn_output = self.attn(
             hidden_states=img_modulated,  # Image stream (will be processed as "sample")
             encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
@@ -1107,7 +1097,6 @@ class QwenImageTransformerBlock(nn.Module):
             hidden_states_mask=hidden_states_mask,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             qk_norm_rope_table=(joint_attention_kwargs or {}).get(QK_NORM_ROPE_TABLE_KEY),
-            mixfusion_plan=mixfusion_plan,
         )
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
@@ -1161,9 +1150,10 @@ class QwenImageTransformerBlock(nn.Module):
 class MixFusionInputs:
     """Prepared packed-MixFusion inputs for one denoise step.
 
-    Built by :meth:`QwenImageTransformer2DModel.prepare_mixfusion_inputs`;
-    passing it as ``mixfusion_inputs`` to :meth:`forward` runs the packed
-    chunk-stacked layout through the same body as a batched tensor input.
+    Built by :meth:`QwenImageTransformer2DModel.prepare_mixfusion_inputs`
+    from the MixFusion root hook; the hook then hands the chunk-stacked
+    ``hidden_states`` and RoPE tables to :meth:`forward`, which runs the packed
+    layout through the same body as a batched tensor input.
 
     Only ``hidden_states`` changes across the denoise steps of one generation;
     the remaining fields depend solely on the request shapes and are reused
@@ -1251,6 +1241,17 @@ class QwenImageTransformer2DModel(CachedTransformer):
         },
         # Gather output at proj_out
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
+
+    # MixFusion packed-layout plan (the MixFusion counterpart of _sp_plan, see
+    # distributed/mixfusion_plan.py). The pipeline arms a MixFusionStep on the
+    # forward context per packed denoise step; these boundary hooks then run
+    # the chunk-stacked layout without any MixFusion branching in forward().
+    _mixfusion_plan = {
+        "": MixFusionRoot(pack_method="prepare_mixfusion_inputs"),
+        "image_rope_prepare": MixFusionRopePrepare(),
+        "transformer_blocks.*.img_mod": MixFusionExpandRows(),
+        "norm_out": MixFusionExpandArg(arg_index=1),
     }
 
     def __init__(
@@ -1387,6 +1388,26 @@ class QwenImageTransformer2DModel(CachedTransformer):
                     return True
         return False
 
+    def has_active_root_hooks(self) -> bool:
+        """Whether a hook other than MixFusion's is installed on the root module.
+
+        Cache-style hooks (cache-dit / TeaCache) read ``hidden_states`` before
+        and after the root forward to build keys and decide hits. They share
+        this module's registry with the MixFusion root hook, which swaps in the
+        chunk-stacked batch, so their keys would be computed on the wrong
+        layout (and hook order would decide the result). The packed path
+        refuses to coexist with them and falls back to the serial forward.
+        """
+        registry = getattr(self, "_hook_registry", None)
+        if registry is None:
+            return False
+        names = getattr(registry, "_hooks", {})
+        if any(name != MIXFUSION_PACK_HOOK_NAME for name in names):
+            return True
+        # PyTorch-native hooks on the root module (e.g. FSDP2's unshard
+        # pre-hook) are not visible in the Omni registry.
+        return bool(self._forward_pre_hooks) or bool(self._forward_hooks)
+
     def prepare_mixfusion_inputs(
         self,
         hidden_states: list[torch.Tensor],
@@ -1399,9 +1420,10 @@ class QwenImageTransformer2DModel(CachedTransformer):
     ) -> MixFusionInputs:
         """Split per-request latents into the packed chunk layout and build its plan.
 
-        This is the entire mixfusion-specific preparation; passing the returned
-        bundle to :meth:`forward` runs the packed layout through the same body
-        as a batched tensor input. The RoPE tables, packing plan and per-request
+        This is the entire mixfusion-specific preparation; the MixFusion root
+        hook calls it and hands the packed tensors to :meth:`forward`, which
+        runs the packed layout through the same body as a batched tensor input.
+        The RoPE tables, packing plan and per-request
         image counts depend only on the request shapes, so the bundle from the
         previous denoise step can be handed back as ``cached`` to skip the
         rebuild (only the per-step latents are re-split and re-projected).
@@ -1543,21 +1565,14 @@ class QwenImageTransformer2DModel(CachedTransformer):
         attention_kwargs: dict[str, Any] | None = None,
         additional_t_cond=None,
         return_dict: bool = True,
-        mixfusion_inputs: MixFusionInputs | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput | list[torch.Tensor]:
         """
         The [`QwenTransformer2DModel`] forward method.
 
         Args:
             hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
-                Input `hidden_states`.
-            mixfusion_inputs ([`MixFusionInputs`], *optional*):
-                Prepared packed-MixFusion inputs from
-                `prepare_mixfusion_inputs`. When given, it selects the packed
-                MixFusion path: the requests were already split into
-                equal-length chunks stacked on the batch dimension, they run
-                through the same body as a batched tensor input, and the
-                outputs are reassembled into one tensor per request.
+                Input `hidden_states`. When the MixFusion root hook is armed it
+                rewrites this to the chunk-stacked batch before the body runs.
             encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
             encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
@@ -1574,55 +1589,27 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         Returns:
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
-            `tuple` where the first element is the sample tensor. With `mixfusion_inputs`
-            (packed MixFusion), a `list` of per-request sample tensors is returned instead.
+            `tuple` where the first element is the sample tensor.
         """
-        mixfusion_plan = None
-        image_row_counts = None
-        modulate_index = None
+        # Set split_text_embed_in_sp = False for dual-stream attention
+        # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
+        # Text embeddings must be replicated across SP ranks for correctness.
+        if self.parallel_config.sequence_parallel_size > 1:
+            get_forward_context().split_text_embed_in_sp = False
 
-        if mixfusion_inputs is not None:
-            # Packed MixFusion layout: ``prepare_mixfusion_inputs`` already
-            # split the requests into equal-length chunks and stacked them on
-            # the batch dimension -- the chunk-stacked image stream rides the
-            # standard ``hidden_states`` / ``image_rotary_emb`` arguments and
-            # the plan routes each block's attention call through the packed
-            # attention entry.
-            if attention_kwargs:
-                # The packed path has no ``attention_kwargs`` channel; refusing
-                # keeps a caller's per-attention arguments from being silently
-                # dropped.
-                raise ValueError(
-                    "Qwen MixFusion packed forward does not consume attention_kwargs; "
-                    "pass batched tensor hidden_states (the serial path threads "
-                    "attention_kwargs into every block) or drop them."
-                )
-            hidden_states = mixfusion_inputs.hidden_states
-            encoder_hidden_states_mask = mixfusion_inputs.encoder_hidden_states_mask
-            image_rotary_emb = mixfusion_inputs.image_rotary_emb
-            mixfusion_plan = mixfusion_inputs.plan
-            image_row_counts = mixfusion_inputs.image_row_counts
-        else:
-            # Set split_text_embed_in_sp = False for dual-stream attention
-            # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
-            # Text embeddings must be replicated across SP ranks for correctness.
-            if self.parallel_config.sequence_parallel_size > 1:
-                get_forward_context().split_text_embed_in_sp = False
-
-            # Prepare hidden_states and RoPE via ImageRopePrepare module
-            # _sp_plan will shard hidden_states and vid_freqs together via split_output=True
-            # txt_freqs is kept replicated for dual-stream attention
-            hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
-            image_rotary_emb = (vid_freqs, txt_freqs)
+        # Prepare hidden_states and RoPE via ImageRopePrepare module
+        # _sp_plan will shard hidden_states and vid_freqs together via split_output=True
+        # txt_freqs is kept replicated for dual-stream attention
+        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
+        image_rotary_emb = (vid_freqs, txt_freqs)
 
         # Ensure timestep tensor is on the same device and dtype as hidden_states
         timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
-        if mixfusion_plan is None:
-            # Prepare timestep and modulate_index via ModulateIndexPrepare module
-            # _sp_plan will shard modulate_index via split_output=True (when zero_cond_t=True)
-            # This ensures modulate_index sequence dimension matches sharded hidden_states
-            timestep, modulate_index = self.modulate_index_prepare(timestep, img_shapes)
+        # Prepare timestep and modulate_index via ModulateIndexPrepare module
+        # _sp_plan will shard modulate_index via split_output=True (when zero_cond_t=True)
+        # This ensures modulate_index sequence dimension matches sharded hidden_states
+        timestep, modulate_index = self.modulate_index_prepare(timestep, img_shapes)
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
@@ -1676,25 +1663,17 @@ class QwenImageTransformer2DModel(CachedTransformer):
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
 
-        if mixfusion_plan is None:
-            # One packed table per forward for the joint QK RMSNorm + RoPE + cat of
-            # every block. Never mutate the caller-owned dict: rebind to a copy.
-            # The packed path must skip this: the fused table assumes txt and img
-            # share the batch dimension, which the chunk-stacked layout breaks.
-            qk_norm_rope_table = _packed_qk_norm_rope_table(
-                image_rotary_emb[0], image_rotary_emb[1], hidden_states.shape[0], hidden_states.dtype
-            )
-            if qk_norm_rope_table is not None:
-                attention_kwargs = {**(attention_kwargs or {}), QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
-            elif attention_kwargs is not None:
-                attention_kwargs = {k: v for k, v in attention_kwargs.items() if k != QK_NORM_ROPE_TABLE_KEY}
+        # One packed table per forward for the joint QK RMSNorm + RoPE + cat of
+        # every block. Never mutate the caller-owned dict: rebind to a copy.
+        qk_norm_rope_table = _packed_qk_norm_rope_table(
+            image_rotary_emb[0], image_rotary_emb[1], hidden_states.shape[0], hidden_states.dtype
+        )
+        if qk_norm_rope_table is not None:
+            attention_kwargs = {**(attention_kwargs or {}), QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
+        elif attention_kwargs is not None:
+            attention_kwargs = {k: v for k, v in attention_kwargs.items() if k != QK_NORM_ROPE_TABLE_KEY}
 
         for index_block, block in enumerate(self.transformer_blocks):
-            # With a ``mixfusion_plan`` the chunk-stacked image stream rides the
-            # standard block arguments and the plan routes each block's
-            # attention call through the packed attention entry (the SP
-            # all-to-all position); without one this is the plain batched
-            # forward.
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -1704,24 +1683,13 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
                 hidden_states_mask=hidden_states_mask,
-                mixfusion_plan=mixfusion_plan,
             )
 
         if self.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
-        if mixfusion_plan is not None:
-            # Request-level conditioning covers every chunk of its request.
-            temb = expand_per_chunk(temb, mixfusion_plan.chunk_to_request)
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
-
-        if mixfusion_plan is not None:
-            # Reassemble outputs per request: each request owns num_images image
-            # rows, whose chunks are contiguous in request_chunk_ranges. Rebuild
-            # the [num_images, seq, C] latent per request to preserve the
-            # external contract (one tensor per request).
-            return reassemble_chunk_rows(output, mixfusion_plan.request_chunk_ranges, image_row_counts)
 
         # Note: SP gather is handled automatically by _sp_plan's SequenceParallelGatherHook
         # on proj_out output. No manual all_gather needed here.

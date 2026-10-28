@@ -15,6 +15,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import Distribu
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 from vllm_omni.platforms import current_omni_platform
@@ -591,6 +592,11 @@ def initialize_model(
         # at model loading time, not inside individual model files
         _apply_sequence_parallel_if_enabled(model, od_config)
 
+        # Apply the MixFusion packed-layout hooks declared by _mixfusion_plan.
+        # They are the MixFusion counterpart of _sp_plan and stay inert unless
+        # the pipeline arms a MixFusionStep on the forward context.
+        _apply_mixfusion_if_enabled(model, od_config)
+
         # Install the Wan VAE decoder fast path once the VAE parallel mode is
         # known. This runs inside the weight-loading memory pool, so any weight
         # re-layout it performs stays offloadable by sleep mode.
@@ -732,6 +738,74 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
     except Exception as e:
         logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
+
+
+def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Apply MixFusion packed-layout hooks if MixFusion is enabled.
+
+    This is the MixFusion counterpart of :func:`_apply_sequence_parallel_if_enabled`:
+    it applies the ``_mixfusion_plan`` hooks to transformer models that declare
+    one. The hooks pack per-request latents into the chunk-stacked layout at the
+    module boundaries only while the pipeline has armed a ``MixFusionStep`` on
+    the forward context, so a model with the hooks installed still runs its
+    serial forward unchanged when MixFusion is not requested.
+
+    Args:
+        model: The pipeline model (e.g., QwenImagePipeline).
+        od_config: The OmniDiffusion configuration.
+    """
+
+    if not getattr(od_config, "enable_mixfusion", False):
+        return
+
+    try:
+        parallel_config = od_config.parallel_config
+        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
+            # Packed batching splits and stacks the image stream itself; SP
+            # would shard rows a second time.
+            logger.warning_once("MixFusion requires sequence parallelism disabled; MixFusion hooks not applied.")
+            return
+
+        # Prefer the pipeline's declared DiT components so custom component
+        # names receive the same hooks as conventional transformer names.
+        transformer_attrs = getattr(model, "_dit_modules", None)
+        if not transformer_attrs:
+            transformer_attrs = ("transformer", "transformer_2", "dit", "unet")
+        applied_count = 0
+
+        for attr in transformer_attrs:
+            if not hasattr(model, attr):
+                # Some pipelines have recursive
+                # modules that have the transformer
+                module = find_module_with_attr(model, attr)
+                if module is None:
+                    continue
+                model = module
+
+            transformer = getattr(model, attr)
+            if transformer is None:
+                continue
+
+            plan = getattr(transformer, "_mixfusion_plan", None)
+            if plan is None:
+                continue
+
+            logger.info(f"Applying MixFusion hooks to {transformer.__class__.__name__} ({attr}): {', '.join(plan)}")
+            apply_mixfusion(transformer, plan)
+            applied_count += 1
+
+        # update forward context mixfusion_hooks_applied
+        ctx = get_forward_context()
+        ctx.mixfusion_hooks_applied = applied_count > 0
+        logger.debug(f"Setting mixfusion_hooks_applied={ctx.mixfusion_hooks_applied} in ``ForwardContext``!")
+
+        if applied_count == 0:
+            logger.warning(
+                "MixFusion is enabled but no transformer with _mixfusion_plan found. MixFusion hooks not applied."
+            )
+
+    except Exception as e:
+        logger.warning(f"Failed to apply MixFusion hooks: {e}. Continuing without MixFusion hooks.")
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {

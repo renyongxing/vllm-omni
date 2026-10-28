@@ -22,6 +22,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, module_has_active_hooks
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
@@ -81,12 +82,15 @@ class _StubTransformer:
     def __init__(self, *, hooked: bool):
         self.hooked = hooked
         self.packed_calls = 0
+        # Stamped by ``apply_mixfusion``; the pipeline refuses the packed
+        # call when the registry never installed the hooks.
+        self._mixfusion_hooks_applied = True
 
     def has_active_block_hooks(self) -> bool:
         return self.hooked
 
-    def prepare_mixfusion_inputs(self, **kwargs):
-        return SimpleNamespace(hidden_states=torch.zeros(2, 8, 16), encoder_hidden_states_mask=None)
+    def has_active_root_hooks(self) -> bool:
+        return False
 
     def __call__(self, **kwargs):
         self.packed_calls += 1
@@ -200,6 +204,7 @@ def test_denoise_step_mixfusion_packs_when_blocks_are_not_hooked():
         txt_seq_lens=[4, 4],
     )
 
-    assert pipeline._denoise_step_mixfusion(input_batch) == "packed"
+    with override_forward_context(ForwardContext()):
+        assert pipeline._denoise_step_mixfusion(input_batch) == "packed"
     assert transformer.packed_calls == 1
     assert serial_inputs == []

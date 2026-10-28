@@ -25,6 +25,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import MixFusionStep, get_forward_context
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -1051,6 +1052,11 @@ class QwenImagePipeline(
         # under those hooks.
         if self.transformer.has_active_block_hooks():
             return self._denoise_step_serial_ragged(input_batch)
+        # Cache-style hooks on the root see the chunk-stacked batch the
+        # MixFusion root hook swaps in, so their keys would be built on the
+        # wrong layout; use the serial path while any of them is installed.
+        if self.transformer.has_active_root_hooks():
+            return self._denoise_step_serial_ragged(input_batch)
 
         request_extras = input_batch.request_extras or []
         min_chunk_tokens = 256
@@ -1075,30 +1081,38 @@ class QwenImagePipeline(
             )
             return self._denoise_step_serial_ragged(input_batch)
 
-        # Two-step call: the transformer's prepare method owns all mixfusion
-        # layout work (chunk split, RoPE tables, plan); forward then only
-        # consumes the prepared bundle. Layout is step-invariant, so the
-        # bundle from the previous step is handed back as ``cached``.
-        mixfusion_inputs = self.transformer.prepare_mixfusion_inputs(
-            hidden_states=latents,
-            encoder_hidden_states=input_batch.prompt_embeds,
-            encoder_hidden_states_mask=input_batch.prompt_embeds_mask,
-            img_shapes=input_batch.img_shapes,
-            txt_seq_lens=input_batch.txt_seq_lens,
-            attention_kwargs=self.attention_kwargs,
-            cached=getattr(self, "_mixfusion_inputs", None),
-        )
-        self._mixfusion_inputs = mixfusion_inputs
-        positive_kwargs = {
-            "hidden_states": mixfusion_inputs.hidden_states,
-            "timestep": input_batch.timesteps.to(device=latents[0].device, dtype=latents[0].dtype) / 1000,
-            "guidance": input_batch.guidance,
-            "encoder_hidden_states_mask": mixfusion_inputs.encoder_hidden_states_mask,
-            "encoder_hidden_states": input_batch.prompt_embeds,
-            "mixfusion_inputs": mixfusion_inputs,
-            "return_dict": False,
-        }
-        return self.transformer(**positive_kwargs)
+        # The transformer's _mixfusion_plan hooks own all packed-layout work
+        # (chunk split, RoPE tables, plan, output reassembly); the pipeline
+        # only arms the per-step policy on the forward context. The root hook
+        # caches the step-invariant bundle across calls.
+        if not getattr(self.transformer, "_mixfusion_hooks_applied", False):
+            logger.warning_once(
+                "MixFusion hooks are not installed on the transformer; falling back to "
+                "the serial ragged path. Check that enable_mixfusion is set for this model."
+            )
+            return self._denoise_step_serial_ragged(input_batch)
+
+        ctx = get_forward_context()
+        previous = ctx.mixfusion_step
+        ctx.mixfusion_step = MixFusionStep(min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks)
+        try:
+            # ``img_shapes`` / ``txt_seq_lens`` must be forwarded: packing now
+            # happens inside the root hook, which rebuilds the RoPE tables and
+            # plan from them.
+            return self.transformer(
+                hidden_states=input_batch.latents,  # list; the root hook packs it
+                timestep=input_batch.timesteps.to(device=latents[0].device, dtype=latents[0].dtype) / 1000,
+                guidance=input_batch.guidance,
+                encoder_hidden_states=input_batch.prompt_embeds,
+                encoder_hidden_states_mask=input_batch.prompt_embeds_mask,
+                img_shapes=input_batch.img_shapes,
+                txt_seq_lens=input_batch.txt_seq_lens,
+                return_dict=False,
+            )
+        finally:
+            # cfg paths may call the transformer more than once in one step,
+            # so restore rather than relying on per-step context rebuild.
+            ctx.mixfusion_step = previous
 
     def denoise_step(
         self,

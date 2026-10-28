@@ -3,8 +3,9 @@
 """Packing tests for the MixFusion chunked attention path (CPU).
 
 The FlashAttention kernel needs an accelerator, so these tests drive the real
-packing logic — the standard ``QwenImageCrossAttention.forward`` with a
-``mixfusion_plan``, routed through the attention layer's packed entry — with
+packing logic — the standard ``QwenImageCrossAttention.forward`` reading the
+plan from an armed ``MixFusionStep`` on the forward context, routed through
+the attention layer's packed entry — with
 stub projections and a capturing ``forward_packed`` stub: mixed-length
 requests (different text lengths and image chunk counts) must be flattened
 into one packed sequence with per-request ``cu_seqlens``, in each request's
@@ -23,6 +24,11 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.forward_context import (
+    ForwardContext,
+    MixFusionStep,
+    override_forward_context,
+)
 from vllm_omni.diffusion.mixfusion.packed_attention import (
     MIXFUSION_PLAN_KEY,
     run_mixfusion_packed_attention,
@@ -187,13 +193,14 @@ def _forward(module):
         chunk_to_request=chunk_to_request,
         device=image_chunks.device,
     )
-    return module.forward(
-        hidden_states=image_chunks,
-        encoder_hidden_states=encoder_hidden_states,
-        vid_freqs=image_freq_chunks,
-        txt_freqs=text_freqs,
-        mixfusion_plan=plan,
-    )
+    # The attention reads the plan from the armed step, mirroring the pipeline.
+    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(plan=plan))):
+        return module.forward(
+            hidden_states=image_chunks,
+            encoder_hidden_states=encoder_hidden_states,
+            vid_freqs=image_freq_chunks,
+            txt_freqs=text_freqs,
+        )
 
 
 def _assert_rope_matches_eager_dtype_contract(rope: _CapturingRope):
