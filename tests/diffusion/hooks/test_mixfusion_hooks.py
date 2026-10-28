@@ -83,17 +83,13 @@ class _Block(nn.Module):
         # Requires mod rows to match x rows ([num_chunks, chunk, C]); a
         # per-request [B, 1] tensor would broadcast-fail under torch >= 2.1
         # strictness or silently misalign, so assert the row count.
-        assert mod.shape[0] == x.shape[0], (
-            f"img_mod rows {mod.shape[0]} != hidden rows {x.shape[0]}"
-        )
+        assert mod.shape[0] == x.shape[0], f"img_mod rows {mod.shape[0]} != hidden rows {x.shape[0]}"
         return x + mod.unsqueeze(1)
 
 
 class _NormOut(nn.Module):
     def forward(self, x, temb):
-        assert temb.shape[0] == x.shape[0], (
-            f"temb rows {temb.shape[0]} != hidden rows {x.shape[0]}"
-        )
+        assert temb.shape[0] == x.shape[0], f"temb rows {temb.shape[0]} != hidden rows {x.shape[0]}"
         return x
 
 
@@ -121,9 +117,7 @@ class _DummyTransformer(nn.Module):
         self.pack_calls.append({"cached": cached})
         rows = [h.float() for h in hidden_states]
         row_freqs = [torch.arange(SEQ_LEN, dtype=torch.float32).reshape(SEQ_LEN, 1)] * len(rows)
-        chunks, freq_chunks, request_chunk_ranges, chunk_to_request = split_sequence_chunks(
-            rows, row_freqs, CHUNK_SIZE
-        )
+        chunks, freq_chunks, request_chunk_ranges, chunk_to_request = split_sequence_chunks(rows, row_freqs, CHUNK_SIZE)
         packed_hidden = torch.cat(chunks, dim=0)
         return SimpleNamespace(
             hidden_states=packed_hidden,
@@ -150,9 +144,7 @@ class _DummyTransformer(nn.Module):
         attention_kwargs=None,
         return_dict=True,
     ):
-        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(
-            hidden_states, img_shapes, txt_seq_lens
-        )
+        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
         # Keep what the rope boundary produced so tests can tell the packed
         # triple from the stand-in's serial markers apart.
         self.rope_outputs = (vid_freqs, txt_freqs)
@@ -245,12 +237,12 @@ class TestPackedForward:
         # Bit-exact against a hand-rolled reference on the packed layout.
         chunks = [latent.split(CHUNK_SIZE, dim=1) for latent in latents]
         packed = torch.cat([c for req in chunks for c in req], dim=0)
-        temb = torch.arange(NUM_CHUNKS, dtype=torch.float32).reshape(-1, 1)
         expected = packed
         for block in model.transformer_blocks:
             expected = expected + block.img_mod(
-                expand_per_chunk(torch.arange(NUM_REQUESTS, dtype=torch.float32).reshape(-1, 1),
-                                 torch.tensor([0, 0, 1, 1]))
+                expand_per_chunk(
+                    torch.arange(NUM_REQUESTS, dtype=torch.float32).reshape(-1, 1), torch.tensor([0, 0, 1, 1])
+                )
             ).unsqueeze(1)
         expected = reassemble_chunk_rows(expected, [(0, 2), (2, 4)], [1, 1])
         for got, exp in zip(out, expected):

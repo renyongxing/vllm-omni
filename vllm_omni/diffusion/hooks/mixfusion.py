@@ -122,9 +122,7 @@ class MixFusionRootHook(ModelHook):
         # ``forward`` always returns Transformer2DModelOutput here (the model
         # ignores return_dict today); hand the pipeline the bare per-request
         # list the packed path already produced pre-hook.
-        return reassemble_chunk_rows(
-            output.sample, step.plan.request_chunk_ranges, step.image_row_counts
-        )
+        return reassemble_chunk_rows(output.sample, step.plan.request_chunk_ranges, step.image_row_counts)
 
     def reset_state(self, module):
         self._cached = None
@@ -203,9 +201,7 @@ def _spec_hook_name(spec) -> str:
         return MIXFUSION_EXPAND_ROWS_HOOK_NAME
     if isinstance(spec, MixFusionExpandArg):
         return MIXFUSION_EXPAND_ARG_HOOK_NAME
-    raise TypeError(
-        f"Unsupported MixFusion plan entry: {type(spec).__name__} ({spec!r})"
-    )
+    raise TypeError(f"Unsupported MixFusion plan entry: {type(spec).__name__} ({spec!r})")
 
 
 def _spec_hook(spec) -> ModelHook:
@@ -217,9 +213,7 @@ def _spec_hook(spec) -> ModelHook:
         return MixFusionExpandRowsHook()
     if isinstance(spec, MixFusionExpandArg):
         return MixFusionExpandArgHook(spec.arg_index, spec.expected_dims)
-    raise TypeError(
-        f"Unsupported MixFusion plan entry: {type(spec).__name__} ({spec!r})"
-    )
+    raise TypeError(f"Unsupported MixFusion plan entry: {type(spec).__name__} ({spec!r})")
 
 
 def apply_mixfusion(module: nn.Module, plan: dict) -> None:
