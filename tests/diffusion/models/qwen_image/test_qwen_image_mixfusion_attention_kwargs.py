@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that ``attention_kwargs`` survive the MixFusion dispatch (CPU).
 
-The packed ``_forward_mixfusion`` drives blocks through the layout-aware
-``block.forward`` with a ``mixfusion_plan``, which has no
-``attention_kwargs`` channel, so a
-non-empty ``attention_kwargs`` used to be silently dropped when
-``hidden_states`` was a list. The pipeline must fall back to the serial path
-(which threads them into every block), and a direct packed call with
-``attention_kwargs`` must fail loudly instead of ignoring them.
+The packed layout (``prepare_mixfusion_inputs`` + ``mixfusion_inputs`` to
+``forward``) drives blocks through the layout-aware ``block.forward`` with a
+``mixfusion_plan``, which has no ``attention_kwargs`` channel, so a non-empty
+``attention_kwargs`` used to be silently dropped when ``hidden_states`` was a
+list. The pipeline must fall back to the serial path (which threads them into
+every block), and a direct packed call with ``attention_kwargs`` must fail
+loudly instead of ignoring them -- both at the prepare step and at the
+``forward`` that consumes the prepared bundle.
 """
 
 from __future__ import annotations
@@ -55,9 +56,14 @@ class _StubTransformer:
 
     def __init__(self):
         self.packed_calls = 0
+        self.prepare_calls = 0
 
     def has_active_block_hooks(self) -> bool:
         return False
+
+    def prepare_mixfusion_inputs(self, **kwargs):
+        self.prepare_calls += 1
+        return SimpleNamespace(hidden_states=torch.zeros(2, 8, 16), encoder_hidden_states_mask=None)
 
     def __call__(self, **kwargs):
         self.packed_calls += 1
@@ -73,29 +79,40 @@ def _pipeline(transformer) -> QwenImagePipeline:
     return pipeline
 
 
-def test_forward_rejects_attention_kwargs_on_packed_input():
+def test_prepare_rejects_attention_kwargs_on_packed_input():
     with pytest.raises(ValueError, match="does not consume attention_kwargs"):
-        _transformer().forward(
+        _transformer().prepare_mixfusion_inputs(
             hidden_states=[torch.zeros(1, 8, 16)],
             encoder_hidden_states=torch.zeros(1, 4, 8),
-            timestep=torch.zeros(1),
             img_shapes=[(16, 2, 2)],
             txt_seq_lens=[4],
             attention_kwargs=dict(SENTINEL_KWARGS),
         )
 
 
-def test_forward_accepts_empty_attention_kwargs_on_packed_input():
+def test_prepare_accepts_empty_attention_kwargs_on_packed_input():
     # An empty dict carries no per-attention arguments, so the packed dispatch
     # must proceed (here: into the regular input validation).
     with pytest.raises(ValueError, match="at least one hidden-state tensor"):
-        _transformer().forward(
+        _transformer().prepare_mixfusion_inputs(
             hidden_states=[],
             encoder_hidden_states=torch.zeros(1, 4, 8),
-            timestep=torch.zeros(1),
             img_shapes=[(16, 2, 2)],
             txt_seq_lens=[4],
             attention_kwargs={},
+        )
+
+
+def test_forward_rejects_attention_kwargs_with_mixfusion_inputs():
+    # ``forward`` re-checks before consuming the bundle: the guard fires
+    # before any of the ``mixfusion_inputs`` fields are read.
+    with pytest.raises(ValueError, match="does not consume attention_kwargs"):
+        _transformer().forward(
+            hidden_states=torch.zeros(1, 8, 16),
+            encoder_hidden_states=torch.zeros(1, 4, 8),
+            timestep=torch.zeros(1),
+            mixfusion_inputs=object(),
+            attention_kwargs=dict(SENTINEL_KWARGS),
         )
 
 
@@ -142,4 +159,7 @@ def test_denoise_step_mixfusion_packs_without_attention_kwargs():
     )
 
     assert pipeline._denoise_step_mixfusion(input_batch) == "packed"
+    assert transformer.prepare_calls == 1
     assert transformer.packed_calls == 1
+    # The bundle is cached for the next denoise step's ``cached`` fast path.
+    assert pipeline._mixfusion_inputs is not None

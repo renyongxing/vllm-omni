@@ -8,7 +8,8 @@ semantics are unvalidated: under layerwise offload the block-weight prefetch
 step size no longer matches the request count, and HSDP's ``fully_shard``
 registers native forward pre-hooks to all-gather weights against a batch
 dimension that no longer matches the request count. The packed path must
-refuse to run while blocks carry hooks, and the pipeline must fall back to
+refuse to run while blocks carry hooks -- ``prepare_mixfusion_inputs`` raises
+before any packing work -- and the pipeline must fall back to
 the serial path, whose per-request loops route every block through the hooked
 module call.
 """
@@ -84,6 +85,9 @@ class _StubTransformer:
     def has_active_block_hooks(self) -> bool:
         return self.hooked
 
+    def prepare_mixfusion_inputs(self, **kwargs):
+        return SimpleNamespace(hidden_states=torch.zeros(2, 8, 16), encoder_hidden_states_mask=None)
+
     def __call__(self, **kwargs):
         self.packed_calls += 1
         return "packed"
@@ -111,42 +115,39 @@ def test_has_active_block_hooks_reflects_native_block_hooks():
     assert _transformer([_PlainBlock(), _hsdp_like_block()]).has_active_block_hooks()
 
 
-def test_packed_forward_rejects_hooked_blocks():
+def test_packed_prepare_rejects_hooked_blocks():
     transformer = _transformer([_hooked_block()])
 
     with pytest.raises(ValueError, match="hook semantics"):
-        transformer.forward(
+        transformer.prepare_mixfusion_inputs(
             hidden_states=[torch.zeros(1, 8, 16)],
             encoder_hidden_states=torch.zeros(1, 4, 8),
-            timestep=torch.zeros(1),
             img_shapes=[(16, 2, 2)],
             txt_seq_lens=[4],
         )
 
 
-def test_packed_forward_rejects_native_hooked_blocks():
+def test_packed_prepare_rejects_native_hooked_blocks():
     transformer = _transformer([_hsdp_like_block()])
 
     with pytest.raises(ValueError, match="hook semantics"):
-        transformer.forward(
+        transformer.prepare_mixfusion_inputs(
             hidden_states=[torch.zeros(1, 8, 16)],
             encoder_hidden_states=torch.zeros(1, 4, 8),
-            timestep=torch.zeros(1),
             img_shapes=[(16, 2, 2)],
             txt_seq_lens=[4],
         )
 
 
-def test_packed_forward_passes_the_hook_guard_without_hooks():
+def test_packed_prepare_passes_the_hook_guard_without_hooks():
     # Without hooks the guard must not fire; execution continues to the
     # regular input validation (empty hidden states).
     transformer = _transformer([_PlainBlock()])
 
     with pytest.raises(ValueError, match="at least one hidden-state tensor"):
-        transformer.forward(
+        transformer.prepare_mixfusion_inputs(
             hidden_states=[],
             encoder_hidden_states=torch.zeros(1, 4, 8),
-            timestep=torch.zeros(1),
             img_shapes=[(16, 2, 2)],
             txt_seq_lens=[4],
         )

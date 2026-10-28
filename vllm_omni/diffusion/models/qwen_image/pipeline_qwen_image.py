@@ -1075,15 +1075,27 @@ class QwenImagePipeline(
             )
             return self._denoise_step_serial_ragged(input_batch)
 
+        # Two-step call: the transformer's prepare method owns all mixfusion
+        # layout work (chunk split, RoPE tables, plan); forward then only
+        # consumes the prepared bundle. Layout is step-invariant, so the
+        # bundle from the previous step is handed back as ``cached``.
+        mixfusion_inputs = self.transformer.prepare_mixfusion_inputs(
+            hidden_states=latents,
+            encoder_hidden_states=input_batch.prompt_embeds,
+            encoder_hidden_states_mask=input_batch.prompt_embeds_mask,
+            img_shapes=input_batch.img_shapes,
+            txt_seq_lens=input_batch.txt_seq_lens,
+            attention_kwargs=self.attention_kwargs,
+            cached=getattr(self, "_mixfusion_inputs", None),
+        )
+        self._mixfusion_inputs = mixfusion_inputs
         positive_kwargs = {
-            "hidden_states": latents,
+            "hidden_states": mixfusion_inputs.hidden_states,
             "timestep": input_batch.timesteps.to(device=latents[0].device, dtype=latents[0].dtype) / 1000,
             "guidance": input_batch.guidance,
-            "encoder_hidden_states_mask": input_batch.prompt_embeds_mask,
+            "encoder_hidden_states_mask": mixfusion_inputs.encoder_hidden_states_mask,
             "encoder_hidden_states": input_batch.prompt_embeds,
-            "img_shapes": input_batch.img_shapes,
-            "txt_seq_lens": input_batch.txt_seq_lens,
-            "attention_kwargs": self.attention_kwargs,
+            "mixfusion_inputs": mixfusion_inputs,
             "return_dict": False,
         }
         return self.transformer(**positive_kwargs)
